@@ -44,6 +44,7 @@ export function initDb(dbPath?: string): Database.Database {
   migrateModelsV7(db);
   migrateModelsV8(db);
   migrateModelsV9(db);
+  migrateModelsV10(db);
   ensureUnifiedKey(db);
 
   console.log(`Database initialized at ${resolvedPath}`);
@@ -773,6 +774,33 @@ function migrateModelsV9(db: Database.Database) {
   db.prepare(
     "UPDATE models SET enabled = 0 WHERE platform = 'cerebras' AND model_id = 'zai-glm-4.7'"
   ).run();
+}
+
+/**
+ * V10 (May 2026): add multimodal flag for vision-capable models.
+ * Used by the router to skip text-only models when the request contains images.
+ */
+function migrateModelsV10(db: Database.Database) {
+  // Add column (no-op if already exists)
+  try { db.prepare("ALTER TABLE models ADD COLUMN multimodal INTEGER NOT NULL DEFAULT 0").run(); } catch { /* column exists */ }
+
+  const setFlag = db.prepare("UPDATE models SET multimodal = 1 WHERE platform = ? AND model_id = ?");
+  const apply = db.transaction(() => {
+    // Google Gemini — all support vision
+    for (const mid of ['gemini-2.5-pro', 'gemini-2.5-flash', 'gemini-2.5-flash-lite',
+                       'gemini-3.1-pro-preview', 'gemini-3-flash-preview', 'gemini-3.1-flash-lite-preview']) {
+      setFlag.run('google', mid);
+    }
+    // OpenRouter — Gemma models support vision
+    for (const mid of ['google/gemma-4-31b-it:free', 'google/gemma-4-26b-a4b-it:free']) {
+      setFlag.run('openrouter', mid);
+    }
+    // SambaNova — Gemma 3 supports vision
+    setFlag.run('sambanova', 'gemma-3-12b-it');
+    // Groq — Llama 4 Scout has multimodal focus
+    setFlag.run('groq', 'meta-llama/llama-4-scout-17b-16e-instruct');
+  });
+  apply();
 }
 
 function ensureUnifiedKey(db: Database.Database) {

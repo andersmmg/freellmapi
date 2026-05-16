@@ -21,8 +21,14 @@ function getSessionKey(messages: ChatMessage[]): string {
   // stable across turns. Hash the FULL message (not a 100-char slice) so
   // distinct conversations with identical openings don't collide.
   const firstUser = messages.find(m => m.role === 'user');
-  if (!firstUser || typeof firstUser.content !== 'string') return '';
-  const hash = crypto.createHash('sha1').update(firstUser.content).digest('hex');
+  if (!firstUser) return '';
+  const content = typeof firstUser.content === 'string'
+    ? firstUser.content
+    : Array.isArray(firstUser.content)
+      ? firstUser.content.map(p => p.type === 'text' ? p.text : '[image]').join('')
+      : '';
+  if (!content) return '';
+  const hash = crypto.createHash('sha1').update(content).digest('hex');
   return `${hash}:${messages.length > 2 ? 'multi' : 'single'}`;
 }
 
@@ -77,6 +83,24 @@ proxyRouter.get('/models', (_req: Request, res: Response) => {
 
 const MAX_RETRIES = 20;
 
+const contentPartTextSchema = z.object({
+  type: z.literal('text'),
+  text: z.string(),
+});
+
+const imageContentPartSchema = z.object({
+  type: z.literal('image_url'),
+  image_url: z.object({
+    url: z.string(),
+    detail: z.enum(['auto', 'low', 'high']).optional(),
+  }),
+});
+
+const contentPartSchema = z.discriminatedUnion('type', [
+  contentPartTextSchema,
+  imageContentPartSchema,
+]);
+
 const toolCallSchema = z.object({
   id: z.string().min(1),
   type: z.literal('function'),
@@ -95,7 +119,7 @@ const systemMessageSchema = z.object({
 
 const userMessageSchema = z.object({
   role: z.literal('user'),
-  content: z.string(),
+  content: z.union([z.string(), z.array(contentPartSchema)]),
   name: z.string().optional(),
 });
 
@@ -234,10 +258,19 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   // Non-streaming requests reconcile against the provider's real `usage` block
   // (see line ~340). Streaming will drift from real consumption — accepted
   // tradeoff because per-request usage isn't always returned mid-stream.
-  const estimatedInputTokens = messages.reduce((sum, m) => {
-    if (typeof m.content !== 'string') return sum;
-    return sum + Math.ceil(m.content.length / 4);
-  }, 0);
+  function estimateTokens(content: ChatMessage['content']): number {
+    if (typeof content === 'string') return Math.ceil(content.length / 4);
+    if (Array.isArray(content)) {
+      return content.reduce((sum, part) => {
+        if (part.type === 'text') return sum + Math.ceil(part.text.length / 4);
+        // ~100 tokens per image as a routing heuristic
+        return sum + 100;
+      }, 0);
+    }
+    return 0;
+  }
+
+  const estimatedInputTokens = messages.reduce((sum, m) => sum + estimateTokens(m.content), 0);
   const estimatedTotal = estimatedInputTokens + (max_tokens ?? 1000);
 
   // Explicit `model` field pins routing. If the catalog has no enabled row
@@ -266,6 +299,11 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     preferredModel = getStickyModel(messages);
   }
 
+  // Check if any message contains image content parts
+  const requiresMultimodal = messages.some(m =>
+    Array.isArray(m.content) && m.content.some(p => p.type === 'image_url'),
+  );
+
   // Retry loop: on 429/rate limit, skip that model+key and try the next one
   const skipKeys = new Set<string>();
   let lastError: any = null;
@@ -273,7 +311,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
     let route: RouteResult;
     try {
-      route = routeRequest(estimatedTotal, skipKeys.size > 0 ? skipKeys : undefined, preferredModel);
+      route = routeRequest(estimatedTotal, skipKeys.size > 0 ? skipKeys : undefined, preferredModel, requiresMultimodal || undefined);
     } catch (err: any) {
       // No more models available
       if (lastError) {

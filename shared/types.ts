@@ -32,6 +32,7 @@ export interface Model {
   monthlyTokenBudget: string;
   contextWindow: number | null;
   enabled: boolean;
+  multimodal?: boolean;
 }
 
 export type KeyStatus = 'healthy' | 'rate_limited' | 'invalid' | 'error' | 'unknown';
@@ -64,6 +65,23 @@ export interface FallbackEntry {
   priority: number;
   enabled: boolean;
 }
+
+// ---- Multimodal Content Parts ----
+
+export interface ContentPartText {
+  type: 'text';
+  text: string;
+}
+
+export interface ImageContentPart {
+  type: 'image_url';
+  image_url: {
+    url: string;
+    detail?: 'auto' | 'low' | 'high';
+  };
+}
+
+export type ContentPart = ContentPartText | ImageContentPart;
 
 // ---- OpenAI-Compatible Types ----
 
@@ -104,7 +122,7 @@ export type ChatToolChoice =
 
 export interface ChatMessage {
   role: 'system' | 'user' | 'assistant' | 'tool';
-  content: string | null;
+  content: string | null | ContentPart[];
   name?: string;
   tool_call_id?: string;
   tool_calls?: ChatToolCall[];

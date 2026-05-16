@@ -1,5 +1,6 @@
 import type {
   ChatMessage,
+  ContentPart,
   ChatCompletionResponse,
   ChatCompletionChunk,
   Platform,
@@ -162,10 +163,12 @@ function normalizeChoices(data: ChatCompletionResponse): void {
   for (const choice of data.choices ?? []) {
     const msg = choice.message as ChatMessage & { reasoning_content?: string; content: unknown };
     // Flatten array content (Mistral magistral) → join text segments.
+    // Only flatten text-only arrays; preserve multimodal content arrays.
     if (Array.isArray(msg.content)) {
-      msg.content = (msg.content as Array<{ text?: string; type?: string }>)
-        .map(seg => (typeof seg === 'string' ? seg : (seg.text ?? '')))
-        .join('');
+      const parts = msg.content as ContentPart[];
+      if (parts.every(p => p.type === 'text')) {
+        msg.content = parts.map(p => p.text).join('');
+      }
     }
     // Fold reasoning_content into content if content is empty AND there are no
     // tool_calls. With tool_calls present, content=null is the correct OpenAI

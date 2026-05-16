@@ -1,5 +1,6 @@
 import type {
   ChatMessage,
+  ContentPart,
   ChatCompletionResponse,
   ChatCompletionChunk,
   ChatToolCall,
@@ -13,6 +14,10 @@ const API_BASE = 'https://generativelanguage.googleapis.com/v1beta';
 
 interface GeminiPart {
   text?: string;
+  inlineData?: {
+    mimeType: string;
+    data: string;
+  };
   thoughtSignature?: string;
   functionCall?: {
     id?: string;
@@ -100,8 +105,25 @@ function toGeminiToolConfig(toolChoice?: ChatToolChoice): { functionCallingConfi
   };
 }
 
+function parseDataUri(uri: string): { mimeType: string; data: string } | null {
+  const match = uri.match(/^data:([^;]+);base64,(.+)$/);
+  if (match) return { mimeType: match[1], data: match[2] };
+  return null;
+}
+
+async function imageUrlToInlineData(url: string): Promise<{ mimeType: string; data: string }> {
+  const parsed = parseDataUri(url);
+  if (parsed) return parsed;
+  const res = await fetch(url, { signal: AbortSignal.timeout(15_000) });
+  if (!res.ok) throw new Error(`Failed to fetch image: ${res.status} ${res.statusText}`);
+  const mimeType = res.headers.get('content-type') ?? 'image/png';
+  const buf = await res.arrayBuffer();
+  const data = Buffer.from(buf).toString('base64');
+  return { mimeType, data };
+}
+
 // Translate OpenAI messages to Gemini format
-function toGeminiContents(messages: ChatMessage[]) {
+async function toGeminiContents(messages: ChatMessage[]) {
   const systemMessages = messages
     .filter(m => m.role === 'system' && typeof m.content === 'string' && m.content.length > 0)
     .map(m => m.content as string);
@@ -113,59 +135,81 @@ function toGeminiContents(messages: ChatMessage[]) {
     }
   }
 
-  const contents = messages
-    .filter(m => m.role !== 'system')
-    .map((m): { role: 'user' | 'model'; parts: GeminiPart[] } | null => {
-      if (m.role === 'assistant') {
-        const parts: GeminiPart[] = [];
+  const contents = (
+    await Promise.all(
+      messages
+        .filter(m => m.role !== 'system')
+        .map(async (m): Promise<{ role: 'user' | 'model'; parts: GeminiPart[] } | null> => {
+          if (m.role === 'assistant') {
+            const parts: GeminiPart[] = [];
 
-        if (typeof m.content === 'string' && m.content.length > 0) {
-          parts.push({ text: m.content });
-        }
+            if (typeof m.content === 'string' && m.content.length > 0) {
+              parts.push({ text: m.content });
+            }
 
-        for (const call of m.tool_calls ?? []) {
-          parts.push({
-            thoughtSignature: call.thought_signature,
-            functionCall: {
-              id: call.id,
-              name: call.function.name,
-              args: safeParseObject(call.function.arguments),
-            },
-          });
-        }
+            for (const call of m.tool_calls ?? []) {
+              parts.push({
+                thoughtSignature: call.thought_signature,
+                functionCall: {
+                  id: call.id,
+                  name: call.function.name,
+                  args: safeParseObject(call.function.arguments),
+                },
+              });
+            }
 
-        if (parts.length === 0) return null;
-        return {
-          role: 'model',
-          parts,
-        };
-      }
+            if (parts.length === 0) return null;
+            return {
+              role: 'model',
+              parts,
+            };
+          }
 
-      if (m.role === 'tool') {
-        const toolCallId = m.tool_call_id;
-        if (!toolCallId) return null;
+          if (m.role === 'tool') {
+            const toolCallId = m.tool_call_id;
+            if (!toolCallId) return null;
 
-        const toolName = m.name ?? toolNameByCallId.get(toolCallId) ?? 'tool';
-        const response = safeParseObject(typeof m.content === 'string' ? m.content : '');
+            const toolName = m.name ?? toolNameByCallId.get(toolCallId) ?? 'tool';
+            const response = safeParseObject(typeof m.content === 'string' ? m.content : '');
 
-        return {
-          role: 'user',
-          parts: [{
-            functionResponse: {
-              id: toolCallId,
-              name: toolName,
-              response,
-            },
-          }],
-        };
-      }
+            return {
+              role: 'user',
+              parts: [{
+                functionResponse: {
+                  id: toolCallId,
+                  name: toolName,
+                  response,
+                },
+              }],
+            };
+          }
 
-      return {
-        role: 'user',
-        parts: [{ text: typeof m.content === 'string' ? m.content : '' }],
-      };
-    })
-    .filter((entry): entry is { role: 'user' | 'model'; parts: GeminiPart[] } => entry !== null);
+          if (typeof m.content === 'string') {
+            return {
+              role: 'user',
+              parts: [{ text: m.content }],
+            };
+          }
+
+          if (m.content === null) {
+            return {
+              role: 'user',
+              parts: [{ text: '' }],
+            };
+          }
+
+          // ContentPart[] — text and/or image_url parts
+          const parts = await Promise.all(
+            m.content.map(async part => {
+              if (part.type === 'text') return { text: part.text } as GeminiPart;
+              const inlineData = await imageUrlToInlineData(part.image_url.url);
+              return { inlineData } as GeminiPart;
+            }),
+          );
+          return { role: 'user', parts };
+        }),
+    )
+  ).filter((entry): entry is { role: 'user' | 'model'; parts: GeminiPart[] } => entry !== null);
 
   return {
     contents,
@@ -216,7 +260,7 @@ export class GoogleProvider extends BaseProvider {
     modelId: string,
     options?: CompletionOptions,
   ): Promise<ChatCompletionResponse> {
-    const { contents, systemInstruction } = toGeminiContents(messages);
+    const { contents, systemInstruction } = await toGeminiContents(messages);
 
     const body: Record<string, unknown> = {
       contents,
@@ -279,7 +323,7 @@ export class GoogleProvider extends BaseProvider {
     modelId: string,
     options?: CompletionOptions,
   ): AsyncGenerator<ChatCompletionChunk> {
-    const { contents, systemInstruction } = toGeminiContents(messages);
+    const { contents, systemInstruction } = await toGeminiContents(messages);
 
     const body: Record<string, unknown> = {
       contents,
