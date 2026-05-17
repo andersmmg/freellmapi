@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
@@ -25,6 +25,11 @@ function Stat({ label, value, className }: { label: string; value: string | numb
       <p className={`text-xl font-semibold tabular-nums mt-1 ${className ?? ''}`}>{value}</p>
     </div>
   )
+}
+
+function SortIcon({ col, sortBy, sortDir }: { col: string; sortBy: string; sortDir: 'asc' | 'desc' }) {
+  if (sortBy !== col) return <span className="ml-1 opacity-20">↕</span>
+  return <span className="ml-1">{sortDir === 'asc' ? '↑' : '↓'}</span>
 }
 
 function Panel({ title, children }: { title: string; children: React.ReactNode }) {
@@ -74,6 +79,26 @@ export default function AnalyticsPage() {
     queryKey: ['analytics', 'error-distribution', range],
     queryFn: () => apiFetch<{ byCategory: any[]; byPlatform: any[]; detailed: any[] }>(`/api/analytics/error-distribution?range=${range}`),
   })
+
+  const [sortBy, setSortBy] = useState<string>('requests')
+  const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc')
+
+  const sortedModels = useMemo(() => {
+    const arr = [...byModel]
+    const dir = sortDir === 'asc' ? 1 : -1
+    arr.sort((a, b) => {
+      const av = a[sortBy]
+      const bv = b[sortBy]
+      if (typeof av === 'string') return av.localeCompare(bv) * dir
+      return ((av ?? 0) - (bv ?? 0)) * dir
+    })
+    return arr
+  }, [byModel, sortBy, sortDir])
+
+  function toggleSort(col: string) {
+    if (sortBy === col) setSortDir(d => (d === 'asc' ? 'desc' : 'asc'))
+    else { setSortBy(col); setSortDir('desc') }
+  }
 
   return (
     <div>
@@ -169,17 +194,31 @@ export default function AnalyticsPage() {
                   <Table>
                     <TableHeader>
                       <TableRow>
-                        <TableHead className="pl-4">Model</TableHead>
-                        <TableHead>Provider</TableHead>
-                        <TableHead className="text-right">Requests</TableHead>
-                        <TableHead className="text-right">Success</TableHead>
-                        <TableHead className="text-right">Latency</TableHead>
-                        <TableHead className="text-right">In tokens</TableHead>
-                        <TableHead className="text-right pr-4">Out tokens</TableHead>
+                        <TableHead className="pl-4 cursor-pointer select-none" onClick={() => toggleSort('displayName')}>
+                          Model<SortIcon col="displayName" sortBy={sortBy} sortDir={sortDir} />
+                        </TableHead>
+                        <TableHead className="cursor-pointer select-none" onClick={() => toggleSort('platform')}>
+                          Provider<SortIcon col="platform" sortBy={sortBy} sortDir={sortDir} />
+                        </TableHead>
+                        <TableHead className="text-right cursor-pointer select-none" onClick={() => toggleSort('requests')}>
+                          Requests<SortIcon col="requests" sortBy={sortBy} sortDir={sortDir} />
+                        </TableHead>
+                        <TableHead className="text-right cursor-pointer select-none" onClick={() => toggleSort('successRate')}>
+                          Success<SortIcon col="successRate" sortBy={sortBy} sortDir={sortDir} />
+                        </TableHead>
+                        <TableHead className="text-right cursor-pointer select-none" onClick={() => toggleSort('avgLatencyMs')}>
+                          Latency<SortIcon col="avgLatencyMs" sortBy={sortBy} sortDir={sortDir} />
+                        </TableHead>
+                        <TableHead className="text-right cursor-pointer select-none" onClick={() => toggleSort('totalInputTokens')}>
+                          In tokens<SortIcon col="totalInputTokens" sortBy={sortBy} sortDir={sortDir} />
+                        </TableHead>
+                        <TableHead className="text-right pr-4 cursor-pointer select-none" onClick={() => toggleSort('totalOutputTokens')}>
+                          Out tokens<SortIcon col="totalOutputTokens" sortBy={sortBy} sortDir={sortDir} />
+                        </TableHead>
                       </TableRow>
                     </TableHeader>
                     <TableBody>
-                      {byModel.map((m: any, i: number) => (
+                      {sortedModels.map((m: any, i: number) => (
                         <TableRow key={i}>
                           <TableCell className="pl-4 text-sm font-medium">{m.displayName}</TableCell>
                           <TableCell className="text-xs text-muted-foreground">{m.platform}</TableCell>
