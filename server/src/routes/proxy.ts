@@ -187,7 +187,8 @@ function isRetryableError(err: any): boolean {
     || msg.includes('aborted') || msg.includes('timeout') || msg.includes('etimedout')
     || msg.includes('econnrefused') || msg.includes('econnreset')
     || msg.includes('503') || msg.includes('unavailable')
-    || msg.includes('500') || msg.includes('internal server error');
+    || msg.includes('500') || msg.includes('internal server error')
+    || msg.includes('404');
 }
 
 proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
