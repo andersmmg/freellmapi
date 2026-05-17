@@ -188,7 +188,12 @@ function isRetryableError(err: any): boolean {
     || msg.includes('econnrefused') || msg.includes('econnreset')
     || msg.includes('503') || msg.includes('unavailable')
     || msg.includes('500') || msg.includes('internal server error')
-    || msg.includes('404');
+    || msg.includes('404') || msg.includes('no longer available');
+}
+
+function isPermanentError(err: any): boolean {
+  const msg = (err.message ?? '').toLowerCase();
+  return msg.includes('no longer available') || msg.includes('has transitioned');
 }
 
 proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
@@ -416,10 +421,16 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         // Put this model+key on cooldown and try the next one
         const skipId = `${route.platform}:${route.modelId}:${route.keyId}`;
         skipKeys.add(skipId);
-        setCooldown(route.platform, route.modelId, route.keyId, 120_000);
+        if (isPermanentError(err)) {
+          const db = getDb();
+          db.prepare('UPDATE models SET enabled = 0 WHERE id = ?').run(route.modelDbId);
+          console.log(`[Proxy] Disabling ${route.displayName} — ${err.message.slice(0, 120)}`);
+        } else {
+          setCooldown(route.platform, route.modelId, route.keyId, 120_000);
+        }
         recordRateLimitHit(route.modelDbId);
         lastError = err;
-        console.log(`[Proxy] ${err.message.slice(0, 60)} from ${route.displayName}, falling back (attempt ${attempt + 1}/${MAX_RETRIES})`);
+        console.log(`[Proxy] ${err.message.slice(0, 80)} from ${route.displayName}, falling back (attempt ${attempt + 1}/${MAX_RETRIES})`);
         continue;
       }
 
