@@ -72,6 +72,23 @@ function toGeminiFinishReason(finishReason?: string): string {
   return 'stop';
 }
 
+function stripJsonSchemaFields(obj: unknown): unknown {
+  if (Array.isArray(obj)) return obj.map(stripJsonSchemaFields);
+  if (obj && typeof obj === 'object') {
+    const cleaned: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(obj as Record<string, unknown>)) {
+      if (key === '$schema' || key === 'additionalProperties') continue;
+      if (key === 'type' && Array.isArray(value)) {
+        cleaned.type = value.filter((t: unknown) => t !== 'null')[0] ?? 'string';
+        continue;
+      }
+      cleaned[key] = stripJsonSchemaFields(value);
+    }
+    return cleaned;
+  }
+  return obj;
+}
+
 function toGeminiTools(tools?: ChatToolDefinition[]): Array<{ functionDeclarations: Array<Record<string, unknown>> }> | undefined {
   if (!tools || tools.length === 0) return undefined;
 
@@ -79,7 +96,7 @@ function toGeminiTools(tools?: ChatToolDefinition[]): Array<{ functionDeclaratio
     functionDeclarations: tools.map(t => ({
       name: t.function.name,
       description: t.function.description,
-      parameters: t.function.parameters,
+      parameters: t.function.parameters ? stripJsonSchemaFields(t.function.parameters) : undefined,
     })),
   }];
 }
