@@ -9,6 +9,19 @@ import { getDb, getUnifiedApiKey } from '../db/index.js';
 
 export const proxyRouter = Router();
 
+// Constant-time string comparison for the unified API key. Plain `===` leaks
+// length and per-character timing, which a network attacker could in principle
+// use to recover the key one byte at a time.
+function timingSafeStringEqual(provided: string, expected: string): boolean {
+  const a = Buffer.from(provided);
+  const b = Buffer.from(expected);
+  // Compare against a same-length buffer regardless of input length so the
+  // comparison itself runs in constant time; the explicit length check at the
+  // end is what actually decides equality when lengths differ.
+  const compareA = a.length === b.length ? a : Buffer.alloc(b.length);
+  return crypto.timingSafeEqual(compareA, b) && a.length === b.length;
+}
+
 // Sticky sessions: track which model served each "session"
 // Key: hash of first user message → model_db_id
 // This prevents model switching mid-conversation which causes hallucination
@@ -202,11 +215,16 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   // Authenticate with unified API key. Local requests (127.0.0.1) skip the check
   // since they came from the same machine running the server. Non-local requests
   // MUST present a valid Bearer token — missing or wrong → 401.
+  //
+  // Note: req.ip is the actual TCP socket peer because we never set
+  // `trust proxy`, so X-Forwarded-For cannot spoof a localhost identity.
+  // If a future change enables `trust proxy`, this localhost bypass MUST be
+  // re-evaluated.
   const isLocal = req.ip === '127.0.0.1' || req.ip === '::1' || req.ip === '::ffff:127.0.0.1';
   if (!isLocal) {
     const token = req.headers.authorization?.replace(/^Bearer\s+/i, '');
     const unifiedKey = getUnifiedApiKey();
-    if (!token || token !== unifiedKey) {
+    if (!token || !timingSafeStringEqual(token, unifiedKey)) {
       res.status(401).json({
         error: { message: 'Invalid API key', type: 'authentication_error' },
       });
@@ -381,7 +399,10 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           if (streamStarted) {
             // Mid-stream error — finish the SSE response cleanly instead of leaving
             // the client hanging or letting Express's default handler take over.
-            const payload = { error: { message: `Provider error (${route.displayName}): ${streamErr.message}`, type: 'stream_error' } };
+            // Full upstream message goes to the log; the client sees a generic
+            // message so we don't leak provider internals into a partial stream.
+            console.error(`[Proxy] Mid-stream error from ${route.displayName}:`, streamErr.message);
+            const payload = { error: { message: `Provider error (${route.displayName}): stream interrupted`, type: 'stream_error' } };
             try { res.write(`data: ${JSON.stringify(payload)}\n\n`); } catch { /* socket gone */ }
             try { res.write('data: [DONE]\n\n'); res.end(); } catch { /* socket gone */ }
             logRequest(route.platform, route.modelId, 'error', estimatedInputTokens, totalOutputTokens, Date.now() - start, streamErr.message);
