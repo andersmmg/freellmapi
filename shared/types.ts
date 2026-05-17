@@ -1,3 +1,6 @@
+// Auto-routing mode: controls how the fallback chain is prioritized
+export type AutoMode = 'default' | 'smart' | 'fast';
+
 // ---- Platform & Model Types ----
 
 // Active platforms — must match server/src/providers/index.ts and

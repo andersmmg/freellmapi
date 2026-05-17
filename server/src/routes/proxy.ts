@@ -2,7 +2,7 @@ import crypto from 'crypto';
 import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { z } from 'zod';
-import type { ChatMessage } from '@freellmapi/shared/types.js';
+import type { AutoMode, ChatMessage } from '@freellmapi/shared/types.js';
 import { routeRequest, recordRateLimitHit, recordSuccess, type RouteResult } from '../services/router.js';
 import { recordRequest, recordTokens, setCooldown } from '../services/ratelimit.js';
 import { getDb, getUnifiedApiKey } from '../db/index.js';
@@ -45,12 +45,12 @@ function getSessionKey(messages: ChatMessage[]): string {
   return `${hash}:${messages.length > 2 ? 'multi' : 'single'}`;
 }
 
-function getStickyModel(messages: ChatMessage[]): number | undefined {
+function getStickyModel(messages: ChatMessage[], autoMode?: AutoMode): number | undefined {
   // Only apply sticky for multi-turn (has assistant messages = continuation)
   const hasAssistant = messages.some(m => m.role === 'assistant');
   if (!hasAssistant) return undefined;
 
-  const key = getSessionKey(messages);
+  const key = `${getSessionKey(messages)}:${autoMode ?? 'default'}`;
   if (!key) return undefined;
 
   const entry = stickySessionMap.get(key);
@@ -63,8 +63,8 @@ function getStickyModel(messages: ChatMessage[]): number | undefined {
   return entry.modelDbId;
 }
 
-function setStickyModel(messages: ChatMessage[], modelDbId: number) {
-  const key = getSessionKey(messages);
+function setStickyModel(messages: ChatMessage[], modelDbId: number, autoMode?: AutoMode) {
+  const key = `${getSessionKey(messages)}:${autoMode ?? 'default'}`;
   if (!key) return;
   stickySessionMap.set(key, { modelDbId, lastUsed: Date.now() });
 
@@ -81,16 +81,31 @@ function setStickyModel(messages: ChatMessage[], modelDbId: number) {
 proxyRouter.get('/models', (_req: Request, res: Response) => {
   const db = getDb();
   const models = db.prepare('SELECT platform, model_id, display_name, context_window FROM models WHERE enabled = 1 ORDER BY intelligence_rank').all() as any[];
+  const autoModes = [
+    { id: 'auto', name: 'Auto (balanced)', owned_by: 'freellmapi', context_window: null },
+    { id: 'auto/smart', name: 'Auto (smart)', owned_by: 'freellmapi', context_window: null },
+    { id: 'auto/fast', name: 'Auto (fast)', owned_by: 'freellmapi', context_window: null },
+  ];
   res.json({
     object: 'list',
-    data: models.map(m => ({
-      id: m.model_id,
-      object: 'model',
-      created: 0,
-      owned_by: m.platform,
-      name: m.display_name,
-      context_window: m.context_window,
-    })),
+    data: [
+      ...models.map(m => ({
+        id: m.model_id,
+        object: 'model',
+        created: 0,
+        owned_by: m.platform,
+        name: m.display_name,
+        context_window: m.context_window,
+      })),
+      ...autoModes.map(m => ({
+        id: m.id,
+        object: 'model',
+        created: 0,
+        owned_by: m.owned_by,
+        name: m.name,
+        context_window: m.context_window,
+      })),
+    ],
   });
 });
 
@@ -297,27 +312,42 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   const estimatedInputTokens = messages.reduce((sum, m) => sum + estimateTokens(m.content), 0);
   const estimatedTotal = estimatedInputTokens + (max_tokens ?? 1000);
 
-  // Explicit `model` field pins routing. If the catalog has no enabled row
-  // matching the requested id, return 400 — silently auto-routing to a
-  // different model would be surprising to OpenAI-compatible clients.
-  // Sticky-session is the fallback when no `model` field was sent at all.
+  // Parse auto-routing modes: auto, auto/fast, auto/smart, etc.
+  // auto/{mode} strips the prefix and uses the mode for sort prioritization.
   let preferredModel: number | undefined;
-  if (requestedModel && requestedModel !== 'auto') {
-    const db = getDb();
-    const enabled = db.prepare('SELECT id FROM models WHERE model_id = ? AND enabled = 1').get(requestedModel) as { id: number } | undefined;
-    if (enabled) {
-      preferredModel = enabled.id;
+  let autoMode: AutoMode | undefined;
+  if (requestedModel) {
+    const autoMatch = requestedModel.match(/^auto(?:\/(\w+))?$/);
+    if (autoMatch) {
+      autoMode = autoMatch[1] as AutoMode | undefined;
+      if (autoMode && !['smart', 'fast'].includes(autoMode)) {
+        res.status(400).json({
+          error: {
+            message: `Unknown auto mode '${autoMode}'. Supported: auto, auto/smart, auto/fast.`,
+            type: 'invalid_request_error',
+          },
+        });
+        return;
+      }
+      preferredModel = getStickyModel(messages, autoMode);
     } else {
-      const disabled = db.prepare('SELECT id FROM models WHERE model_id = ?').get(requestedModel) as { id: number } | undefined;
-      const reason = disabled ? 'is disabled' : 'is not in the catalog';
-      res.status(400).json({
-        error: {
-          message: `Model '${requestedModel}' ${reason}. Omit the 'model' field to auto-route, or call /v1/models for the available list.`,
-          type: 'invalid_request_error',
-          code: 'model_not_found',
-        },
-      });
-      return;
+      // Explicit model pinning
+      const db = getDb();
+      const enabled = db.prepare('SELECT id FROM models WHERE model_id = ? AND enabled = 1').get(requestedModel) as { id: number } | undefined;
+      if (enabled) {
+        preferredModel = enabled.id;
+      } else {
+        const disabled = db.prepare('SELECT id FROM models WHERE model_id = ?').get(requestedModel) as { id: number } | undefined;
+        const reason = disabled ? 'is disabled' : 'is not in the catalog';
+        res.status(400).json({
+          error: {
+            message: `Model '${requestedModel}' ${reason}. Omit the 'model' field to auto-route, or call /v1/models for the available list.`,
+            type: 'invalid_request_error',
+            code: 'model_not_found',
+          },
+        });
+        return;
+      }
     }
   } else {
     preferredModel = getStickyModel(messages);
@@ -335,7 +365,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
     let route: RouteResult;
     try {
-      route = routeRequest(estimatedTotal, skipKeys.size > 0 ? skipKeys : undefined, preferredModel, requiresMultimodal || undefined);
+      route = routeRequest(estimatedTotal, skipKeys.size > 0 ? skipKeys : undefined, preferredModel, requiresMultimodal || undefined, autoMode);
     } catch (err: any) {
       // No more models available
       if (lastError) {
@@ -392,8 +422,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
 
           recordTokens(route.platform, route.modelId, route.keyId, estimatedInputTokens + totalOutputTokens);
           recordSuccess(route.modelDbId);
-          setStickyModel(messages, route.modelDbId);
-          logRequest(route.platform, route.modelId, 'success', estimatedInputTokens, totalOutputTokens, Date.now() - start, null);
+          setStickyModel(messages, route.modelDbId, autoMode);
           return;
         } catch (streamErr: any) {
           if (streamStarted) {
@@ -420,7 +449,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         const totalTokens = result.usage?.total_tokens ?? 0;
         recordTokens(route.platform, route.modelId, route.keyId, totalTokens);
         recordSuccess(route.modelDbId);
-        setStickyModel(messages, route.modelDbId);
+        setStickyModel(messages, route.modelDbId, autoMode);
 
         res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
         if (attempt > 0) res.setHeader('X-Fallback-Attempts', String(attempt));

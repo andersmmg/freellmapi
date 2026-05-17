@@ -132,9 +132,12 @@ export default function PlaygroundPage() {
     inputRef.current?.focus()
   }
 
-  const activeModelLabel = selectedModel === 'auto'
-    ? 'Auto (fallback chain)'
-    : availableModels.find(m => m.modelId === selectedModel)?.displayName ?? selectedModel
+  const autoLabels: Record<string, string> = {
+    auto: 'Auto (balanced)',
+    'auto/smart': 'Auto (smart)',
+    'auto/fast': 'Auto (fast)',
+  }
+  const activeModelLabel = autoLabels[selectedModel] ?? availableModels.find(m => m.modelId === selectedModel)?.displayName ?? selectedModel
 
   return (
     <div className="flex flex-col h-[calc(100vh-8rem)]">
@@ -148,7 +151,9 @@ export default function PlaygroundPage() {
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="auto">Auto (fallback chain)</SelectItem>
+                <SelectItem value="auto">Auto (balanced)</SelectItem>
+                <SelectItem value="auto/smart">Auto (smart)</SelectItem>
+                <SelectItem value="auto/fast">Auto (fast)</SelectItem>
                 {availableModels.map(m => (
                   <SelectItem key={m.modelDbId} value={m.modelId}>
                     <span className="flex items-center gap-2">

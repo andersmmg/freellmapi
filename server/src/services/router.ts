@@ -3,6 +3,7 @@ import { getProvider } from '../providers/index.js';
 import { decrypt } from '../lib/crypto.js';
 import { canMakeRequest, canUseTokens, isOnCooldown } from './ratelimit.js';
 import type { BaseProvider } from '../providers/base.js';
+import type { AutoMode } from '@freellmapi/shared/types.js';
 
 interface ModelRow {
   id: number;
@@ -132,14 +133,18 @@ export function getAllPenalties(): Array<{ modelDbId: number; count: number; pen
  * @param skipKeys - set of "platform:modelId:keyId" to skip (failed on this request)
  * @param preferredModelDbId - try this model first (sticky session)
  */
-export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, preferredModelDbId?: number, requireMultimodal?: boolean): RouteResult {
+export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, preferredModelDbId?: number, requireMultimodal?: boolean, autoMode?: AutoMode): RouteResult {
   const db = getDb();
 
-  // Get fallback chain ordered by priority
+  // Get fallback chain ordered by the relevant priority
+  const orderCol = autoMode === 'smart' ? 'm.intelligence_rank'
+    : autoMode === 'fast' ? 'm.speed_rank'
+    : 'fc.priority';
   const fallbackChain = db.prepare(`
-    SELECT fc.model_db_id, fc.priority, fc.enabled
+    SELECT fc.model_db_id, COALESCE(${orderCol}, fc.priority) AS priority, fc.enabled
     FROM fallback_config fc
-    ORDER BY fc.priority ASC
+    ${autoMode ? 'JOIN models m ON m.id = fc.model_db_id' : ''}
+    ORDER BY ${orderCol} ASC
   `).all() as FallbackRow[];
 
   // Apply dynamic penalties: sort by (base priority + penalty)
