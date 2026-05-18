@@ -216,7 +216,8 @@ function isRetryableError(err: any): boolean {
     || msg.includes('econnrefused') || msg.includes('econnreset')
     || msg.includes('503') || msg.includes('unavailable')
     || msg.includes('500') || msg.includes('internal server error')
-    || msg.includes('404') || msg.includes('no longer available');
+    || msg.includes('404') || msg.includes('no longer available')
+    || msg.includes('thought_signature');
 }
 
 function isPermanentError(err: any): boolean {
