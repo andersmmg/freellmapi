@@ -217,7 +217,8 @@ function isRetryableError(err: any): boolean {
     || msg.includes('503') || msg.includes('unavailable')
     || msg.includes('500') || msg.includes('internal server error')
     || msg.includes('404') || msg.includes('no longer available')
-    || msg.includes('thought_signature');
+    || msg.includes('thought_signature')
+    || msg.includes('413') || msg.includes('request too large');
 }
 
 function isPermanentError(err: any): boolean {
