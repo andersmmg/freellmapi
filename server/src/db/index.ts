@@ -45,6 +45,7 @@ export function initDb(dbPath?: string): Database.Database {
   migrateModelsV8(db);
   migrateModelsV9(db);
   migrateModelsV10(db);
+  migrateModelsV11(db);
   ensureUnifiedKey(db);
 
   console.log(`Database initialized at ${resolvedPath}`);
@@ -162,6 +163,10 @@ function seedModels(db: Database.Database) {
     ['zhipu', 'glm-4.5-flash', 'GLM-4.5 Flash', 5, 4, 'Large', null, null, null, 1000000, '~30M', 131072],
     ['moonshot', 'kimi-latest', 'Kimi Latest', 4, 8, 'Large', 60, null, null, 500000, '~15M', 200000],
     ['minimax', 'MiniMax-M1', 'MiniMax M1', 5, 8, 'Large', 20, null, 1000000, null, '~30M', 200000],
+    // Audio transcription models
+    ['groq', 'whisper-large-v3', 'Whisper Large V3', 99, 99, '', 20, 200, null, null, '~6M', null],
+    ['groq', 'whisper-large-v3-turbo', 'Whisper Large V3 Turbo', 99, 99, '', 20, 200, null, null, '~6M', null],
+    ['cloudflare', '@cf/openai/whisper', 'Whisper (Cloudflare)', 99, 99, '', null, null, null, null, 'shared', null],
   ];
 
   const insertMany = db.transaction(() => {
@@ -801,6 +806,31 @@ function migrateModelsV10(db: Database.Database) {
     setFlag.run('groq', 'meta-llama/llama-4-scout-17b-16e-instruct');
   });
   apply();
+}
+
+/**
+ * V11 (May 2026): seed audio transcription models.
+ */
+function migrateModelsV11(db: Database.Database) {
+  const insert = db.prepare(`
+    INSERT OR IGNORE INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, rpm_limit, rpd_limit, monthly_token_budget, enabled)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+  `);
+  const addFb = db.prepare('INSERT OR IGNORE INTO fallback_config (model_db_id, priority, enabled) VALUES (?, ?, 1)');
+
+  const models: [string, string, string, number, number, string, number | null, number | null, string][] = [
+    ['groq', 'whisper-large-v3', 'Whisper Large V3', 99, 99, '', 20, 200, '~6M'],
+    ['groq', 'whisper-large-v3-turbo', 'Whisper Large V3 Turbo', 99, 99, '', 20, 200, '~6M'],
+    ['cloudflare', '@cf/openai/whisper', 'Whisper (Cloudflare)', 99, 99, '', null, null, 'shared'],
+  ];
+  const tx = db.transaction(() => {
+    for (const m of models) {
+      insert.run(...m);
+      const row = db.prepare('SELECT id FROM models WHERE platform = ? AND model_id = ?').get(m[0], m[1]) as { id: number } | undefined;
+      if (row) addFb.run(row.id, 99 + models.indexOf(m));
+    }
+  });
+  tx();
 }
 
 function ensureUnifiedKey(db: Database.Database) {

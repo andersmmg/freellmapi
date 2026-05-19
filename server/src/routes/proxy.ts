@@ -6,6 +6,10 @@ import type { AutoMode, ChatMessage } from '@freellmapi/shared/types.js';
 import { routeRequest, recordRateLimitHit, recordSuccess, type RouteResult } from '../services/router.js';
 import { recordRequest, recordTokens, setCooldown } from '../services/ratelimit.js';
 import { getDb, getUnifiedApiKey } from '../db/index.js';
+import { getProvider } from '../providers/index.js';
+import { decrypt } from '../lib/crypto.js';
+import type { BaseProvider } from '../providers/base.js';
+import busboy from 'busboy';
 
 export const proxyRouter = Router();
 
@@ -503,6 +507,133 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
       message: `All models rate-limited after ${MAX_RETRIES} attempts. Last: ${lastError?.message}`,
       type: 'rate_limit_error',
     },
+  });
+});
+
+// ── Audio Transcription ──
+
+function parseMultipart(req: Request): Promise<{ fields: Record<string, string>; file: Buffer; fileName: string }> {
+  return new Promise((resolve, reject) => {
+    const bb = busboy({ headers: req.headers });
+    const fields: Record<string, string> = {};
+    let file: Buffer | null = null;
+    let fileName = '';
+
+    bb.on('field', (name: string, val: string) => { fields[name] = val; });
+    bb.on('file', (_fieldname: string, stream: any, info: { filename: string }) => {
+      fileName = info.filename;
+      const chunks: Buffer[] = [];
+      stream.on('data', (chunk: Buffer) => chunks.push(chunk));
+      stream.on('end', () => { file = Buffer.concat(chunks); });
+    });
+    bb.on('finish', () => {
+      if (!file) return reject(new Error('No file uploaded'));
+      resolve({ fields, file, fileName });
+    });
+    bb.on('error', reject);
+    req.pipe(bb);
+  });
+}
+
+proxyRouter.post('/audio/transcriptions', async (req: Request, res: Response) => {
+  const start = Date.now();
+
+  // Auth (same as chat completions)
+  const isLocal = req.ip === '127.0.0.1' || req.ip === '::1' || req.ip === '::ffff:127.0.0.1';
+  if (!isLocal) {
+    const auth = req.headers.authorization;
+    if (!auth || !auth.startsWith('Bearer ')) {
+      res.status(401).json({ error: { message: 'Missing or invalid API key', type: 'auth_error', code: 'missing_api_key' } });
+      return;
+    }
+    const expected = getUnifiedApiKey();
+    if (!timingSafeStringEqual(auth.slice(7), expected)) {
+      res.status(401).json({ error: { message: 'Invalid API key', type: 'auth_error', code: 'invalid_api_key' } });
+      return;
+    }
+  }
+
+  let fields: Record<string, string>;
+  let file: Buffer;
+  let fileName: string;
+  try {
+    const parsed = await parseMultipart(req);
+    fields = parsed.fields;
+    file = parsed.file;
+    fileName = parsed.fileName || 'audio.webm';
+  } catch (err: any) {
+    res.status(400).json({ error: { message: err.message || 'Invalid multipart upload', type: 'invalid_request_error' } });
+    return;
+  }
+
+  const modelId = fields.model || 'whisper-large-v3';
+  const db = getDb();
+
+  // Determine which providers to try
+  interface TranscriptionTry { provider: BaseProvider; apiKey: string; keyId: number; modelId: string; displayName: string; platform: string }
+  const candidates: TranscriptionTry[] = [];
+
+  if (fields.model) {
+    // Specific model — look up the exact model
+    const row = db.prepare('SELECT id, platform, model_id, display_name FROM models WHERE model_id = ? AND enabled = 1').get(modelId) as any | undefined;
+    if (row) {
+      const provider = getProvider(row.platform);
+      if (provider?.transcribe) {
+        const keyRow = db.prepare('SELECT id, encrypted_key, iv, auth_tag FROM api_keys WHERE platform = ? AND enabled = 1 AND status != ? ORDER BY id LIMIT 1').get(row.platform, 'invalid') as any | undefined;
+        if (keyRow) {
+          const apiKey = decrypt(keyRow.encrypted_key, keyRow.iv, keyRow.auth_tag);
+          candidates.push({ provider, apiKey, keyId: keyRow.id, modelId: row.model_id, displayName: row.display_name, platform: row.platform });
+        }
+      }
+    }
+    if (candidates.length === 0) {
+      res.status(400).json({ error: { message: `Model '${modelId}' not found or no keys available for transcription`, type: 'invalid_request_error' } });
+      return;
+    }
+  } else {
+    // Auto-route: try providers with transcription keys in order
+    for (const platform of ['groq', 'cloudflare'] as const) {
+      const provider = getProvider(platform);
+      if (!provider?.transcribe) continue;
+      const keyRow = db.prepare('SELECT id, encrypted_key, iv, auth_tag FROM api_keys WHERE platform = ? AND enabled = 1 AND status != ? ORDER BY id LIMIT 1').get(platform, 'invalid') as any | undefined;
+      if (!keyRow) continue;
+      const apiKey = decrypt(keyRow.encrypted_key, keyRow.iv, keyRow.auth_tag);
+      const modelForPlatform = platform === 'groq' ? modelId : '@cf/openai/whisper';
+      candidates.push({ provider, apiKey, keyId: keyRow.id, modelId: modelForPlatform, displayName: `Whisper (${platform})`, platform });
+    }
+  }
+
+  // Try each candidate until one succeeds
+  let lastErr: any = null;
+  for (const c of candidates) {
+    try {
+      const result = await c.provider.transcribe!(c.apiKey, file, fileName, c.modelId, {
+        language: fields.language,
+        prompt: fields.prompt,
+        response_format: fields.response_format,
+        temperature: fields.temperature ? parseFloat(fields.temperature) : undefined,
+      });
+
+      res.json(result);
+      // Log success
+      try {
+        db.prepare('INSERT INTO requests (platform, model_id, status, input_tokens, output_tokens, latency_ms, error) VALUES (?, ?, ?, ?, ?, ?, ?)')
+          .run(c.platform, c.modelId, 'success', 0, 0, Date.now() - start, null);
+      } catch { /* log best-effort */ }
+      return;
+    } catch (err: any) {
+      lastErr = err;
+      console.log(`[Proxy] Transcription error from ${c.displayName}: ${err.message.slice(0, 100)}`);
+      // Log failure
+      try {
+        db.prepare('INSERT INTO requests (platform, model_id, status, input_tokens, output_tokens, latency_ms, error) VALUES (?, ?, ?, ?, ?, ?, ?)')
+          .run(c.platform, c.modelId, 'error', 0, 0, Date.now() - start, err.message?.slice(0, 200));
+      } catch { /* log best-effort */ }
+    }
+  }
+
+  res.status(502).json({
+    error: { message: `All transcription providers failed. Last error: ${lastErr?.message ?? 'Unknown'}`, type: 'provider_error' },
   });
 });
 

@@ -5,6 +5,7 @@ import type {
   ChatToolDefinition,
   ChatToolChoice,
   Platform,
+  TranscriptionResult,
 } from '@freellmapi/shared/types.js';
 
 export interface CompletionOptions {
@@ -36,6 +37,15 @@ export abstract class BaseProvider {
   ): AsyncGenerator<ChatCompletionChunk>;
 
   abstract validateKey(apiKey: string): Promise<boolean>;
+
+  /** Transcribe audio. Not all providers support this. */
+  transcribe?(
+    apiKey: string,
+    audioData: Buffer,
+    fileName: string,
+    modelId: string,
+    options?: { language?: string; prompt?: string; response_format?: string; temperature?: number },
+  ): Promise<TranscriptionResult>;
 
   protected async fetchWithTimeout(
     url: string,

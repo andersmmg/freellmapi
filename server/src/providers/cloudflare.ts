@@ -2,6 +2,7 @@ import type {
   ChatMessage,
   ChatCompletionResponse,
   ChatCompletionChunk,
+  TranscriptionResult,
 } from '@freellmapi/shared/types.js';
 import { BaseProvider, type CompletionOptions } from './base.js';
 
@@ -124,6 +125,34 @@ export class CloudflareProvider extends BaseProvider {
         }
       }
     }
+  }
+
+  async transcribe(
+    apiKey: string,
+    audioData: Buffer,
+    _fileName: string,
+    modelId: string,
+    options?: { language?: string; prompt?: string; response_format?: string; temperature?: number },
+  ): Promise<TranscriptionResult> {
+    const { accountId, token } = this.parseKey(apiKey);
+    const url = `https://api.cloudflare.com/client/v4/accounts/${accountId}/ai/run/${modelId}`;
+    const body: Record<string, unknown> = { audio: audioData.toString('base64') };
+    if (options?.language) body.language = options.language;
+    if (options?.prompt) body.initial_prompt = options.prompt;
+
+    const res = await this.fetchWithTimeout(url, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(`Cloudflare API error ${res.status}: ${(err as any).errors?.[0]?.message ?? res.statusText}`);
+    }
+
+    const data = await res.json() as any;
+    return { text: data.result?.text ?? '' };
   }
 
   async validateKey(apiKey: string): Promise<boolean> {

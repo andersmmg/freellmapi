@@ -1,6 +1,10 @@
 // Auto-routing mode: controls how the fallback chain is prioritized
 export type AutoMode = 'default' | 'smart' | 'fast';
 
+export interface TranscriptionResult {
+  text: string;
+}
+
 // ---- Platform & Model Types ----
 
 // Active platforms — must match server/src/providers/index.ts and

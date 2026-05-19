@@ -4,6 +4,7 @@ import type {
   ChatCompletionResponse,
   ChatCompletionChunk,
   Platform,
+  TranscriptionResult,
 } from '@freellmapi/shared/types.js';
 import { BaseProvider, type CompletionOptions } from './base.js';
 
@@ -132,6 +133,40 @@ export class OpenAICompatProvider extends BaseProvider {
         }
       }
     }
+  }
+
+  async transcribe(
+    apiKey: string,
+    audioData: Buffer,
+    fileName: string,
+    modelId: string,
+    options?: { language?: string; prompt?: string; response_format?: string; temperature?: number },
+  ): Promise<TranscriptionResult> {
+    const form = new FormData();
+    const type = fileName.endsWith('.mp3') ? 'audio/mpeg'
+      : fileName.endsWith('.wav') ? 'audio/wav'
+      : fileName.endsWith('.ogg') ? 'audio/ogg'
+      : fileName.endsWith('.m4a') ? 'audio/mp4'
+      : 'audio/webm';
+    form.append('file', new File([audioData], fileName, { type }));
+    form.append('model', modelId);
+    if (options?.language) form.append('language', options.language);
+    if (options?.prompt) form.append('prompt', options.prompt);
+    if (options?.response_format) form.append('response_format', options.response_format);
+    if (options?.temperature != null) form.append('temperature', String(options.temperature));
+
+    const res = await this.fetchWithTimeout(`${this.baseUrl}/audio/transcriptions`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${apiKey}`, ...this.extraHeaders },
+      body: form,
+    });
+
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(`${this.name} API error ${res.status}: ${(err as any).error?.message ?? res.statusText}`);
+    }
+
+    return res.json() as Promise<TranscriptionResult>;
   }
 
   async validateKey(apiKey: string): Promise<boolean> {
