@@ -20,6 +20,11 @@ const PLATFORMS: { value: Platform; label: string }[] = [
   { value: 'cohere', label: 'Cohere' },
   { value: 'cloudflare', label: 'Cloudflare Workers AI' },
   { value: 'zhipu', label: 'Zhipu AI (Z.ai)' },
+  { value: 'ollama', label: 'Ollama Cloud' },
+  { value: 'kilo', label: 'Kilo Gateway (anon ok)' },
+  { value: 'pollinations', label: 'Pollinations (anon ok)' },
+  { value: 'llm7', label: 'LLM7 (anon ok)' },
+  { value: 'huggingface', label: 'HuggingFace Router' },
 ]
 
 const statusDot: Record<string, string> = {

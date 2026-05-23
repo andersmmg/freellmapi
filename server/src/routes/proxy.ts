@@ -9,9 +9,16 @@ import { getDb, getUnifiedApiKey } from '../db/index.js';
 import { getProvider } from '../providers/index.js';
 import { decrypt } from '../lib/crypto.js';
 import type { BaseProvider } from '../providers/base.js';
+import { contentToString } from '../lib/content.js';
 import busboy from 'busboy';
 
 export const proxyRouter = Router();
+
+// Virtual "auto" model. Clients like Hermes require a non-empty `model` field
+// on every request, but freellmapi's whole point is to pick the model itself.
+// Requesting this id means "let the router decide" — identical to omitting
+// `model` entirely.
+const AUTO_MODEL_ID = 'auto';
 
 // Constant-time string comparison for the unified API key. Plain `===` leaks
 // length and per-character timing, which a network attacker could in principle
@@ -93,6 +100,14 @@ proxyRouter.get('/models', (_req: Request, res: Response) => {
   res.json({
     object: 'list',
     data: [
+      {
+        id: AUTO_MODEL_ID,
+        object: 'model',
+        created: 0,
+        owned_by: 'freellmapi',
+        name: 'Auto (router picks the best available model)',
+        context_window: null,
+      },
       ...models.map(m => ({
         id: m.model_id,
         object: 'model',
@@ -115,24 +130,6 @@ proxyRouter.get('/models', (_req: Request, res: Response) => {
 
 const MAX_RETRIES = 20;
 
-const contentPartTextSchema = z.object({
-  type: z.literal('text'),
-  text: z.string(),
-});
-
-const imageContentPartSchema = z.object({
-  type: z.literal('image_url'),
-  image_url: z.object({
-    url: z.string(),
-    detail: z.enum(['auto', 'low', 'high']).optional(),
-  }),
-});
-
-const contentPartSchema = z.discriminatedUnion('type', [
-  contentPartTextSchema,
-  imageContentPartSchema,
-]);
-
 const toolCallSchema = z.object({
   id: z.string().min(1),
   type: z.literal('function'),
@@ -143,25 +140,39 @@ const toolCallSchema = z.object({
   thought_signature: z.string().optional(),
 });
 
+// OpenAI multimodal envelope. Clients like opencode / continue.dev send
+// content as an array of typed blocks even when only text is present. We
+// accept the envelope on the wire and flatten to string for providers that
+// don't support arrays (Cohere, Cloudflare). Non-text blocks pass z validation
+// but get dropped by contentToString — vision/audio still isn't supported.
+const contentBlockSchema = z.object({ type: z.string() }).passthrough();
+const contentSchema = z.union([z.string(), z.array(contentBlockSchema)]);
+
+function hasNonEmptyContent(content: unknown): boolean {
+  if (typeof content === 'string') return content.length > 0;
+  if (Array.isArray(content)) return content.length > 0;
+  return false;
+}
+
 const systemMessageSchema = z.object({
   role: z.literal('system'),
-  content: z.string(),
+  content: contentSchema,
   name: z.string().optional(),
 });
 
 const userMessageSchema = z.object({
   role: z.literal('user'),
-  content: z.union([z.string(), z.array(contentPartSchema)]),
+  content: contentSchema,
   name: z.string().optional(),
 });
 
 const assistantMessageSchema = z.object({
   role: z.literal('assistant'),
-  content: z.string().nullable().optional(),
+  content: z.union([contentSchema, z.null()]).optional(),
   name: z.string().optional(),
   tool_calls: z.array(toolCallSchema).optional(),
 }).refine((msg) => {
-  const hasContent = typeof msg.content === 'string' && msg.content.length > 0;
+  const hasContent = hasNonEmptyContent(msg.content);
   const hasToolCalls = (msg.tool_calls?.length ?? 0) > 0;
   return hasContent || hasToolCalls;
 }, {
@@ -170,7 +181,7 @@ const assistantMessageSchema = z.object({
 
 const toolMessageSchema = z.object({
   role: z.literal('tool'),
-  content: z.string(),
+  content: contentSchema,
   tool_call_id: z.string().min(1),
   name: z.string().optional(),
 });
@@ -212,7 +223,7 @@ const chatCompletionSchema = z.object({
   parallel_tool_calls: z.boolean().optional(),
 });
 
-function isRetryableError(err: any): boolean {
+export function isRetryableError(err: any): boolean {
   const msg = (err.message ?? '').toLowerCase();
   return msg.includes('429') || msg.includes('rate limit') || msg.includes('too many requests')
     || msg.includes('quota') || msg.includes('resource_exhausted')
@@ -220,9 +231,16 @@ function isRetryableError(err: any): boolean {
     || msg.includes('econnrefused') || msg.includes('econnreset')
     || msg.includes('503') || msg.includes('unavailable')
     || msg.includes('500') || msg.includes('internal server error')
-    || msg.includes('404') || msg.includes('no longer available')
-    || msg.includes('thought_signature')
-    || msg.includes('413') || msg.includes('request too large');
+    // 413: this model's payload limit is too small for the request, but another
+    // provider in the fallback chain may have a larger limit. Same reasoning as 503.
+    || msg.includes('413') || msg.includes('payload too large') || msg.includes('request body too large')
+    || msg.includes('request entity too large') || msg.includes('content too large')
+    // 404: model deprecated/removed upstream (e.g. OpenRouter's "no endpoints found"
+    // for a model that's been pulled). Rotate to the next model in the chain —
+    // setCooldown + the health checker will avoid this model on subsequent requests.
+    || msg.includes('404') || msg.includes('not found') || msg.includes('no endpoints found')
+    || msg.includes('no longer available')
+    || msg.includes('thought_signature');
 }
 
 function isPermanentError(err: any): boolean {
@@ -233,24 +251,16 @@ function isPermanentError(err: any): boolean {
 proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   const start = Date.now();
 
-  // Authenticate with unified API key. Local requests (127.0.0.1) skip the check
-  // since they came from the same machine running the server. Non-local requests
-  // MUST present a valid Bearer token — missing or wrong → 401.
-  //
-  // Note: req.ip is the actual TCP socket peer because we never set
-  // `trust proxy`, so X-Forwarded-For cannot spoof a localhost identity.
-  // If a future change enables `trust proxy`, this localhost bypass MUST be
-  // re-evaluated.
-  const isLocal = req.ip === '127.0.0.1' || req.ip === '::1' || req.ip === '::ffff:127.0.0.1';
-  if (!isLocal) {
-    const token = req.headers.authorization?.replace(/^Bearer\s+/i, '');
-    const unifiedKey = getUnifiedApiKey();
-    if (!token || !timingSafeStringEqual(token, unifiedKey)) {
-      res.status(401).json({
-        error: { message: 'Invalid API key', type: 'authentication_error' },
-      });
-      return;
-    }
+  // Authenticate with the unified API key for every proxy request, including
+  // loopback callers. Browser pages can reach localhost, so socket locality is
+  // not a reliable authorization boundary.
+  const token = req.headers.authorization?.replace(/^Bearer\s+/i, '');
+  const unifiedKey = getUnifiedApiKey();
+  if (!token || !timingSafeStringEqual(token, unifiedKey)) {
+    res.status(401).json({
+      error: { message: 'Invalid API key', type: 'authentication_error' },
+    });
+    return;
   }
 
   // Validate request
@@ -307,8 +317,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     if (typeof content === 'string') return Math.ceil(content.length / 4);
     if (Array.isArray(content)) {
       return content.reduce((sum, part) => {
-        if (part.type === 'text') return sum + Math.ceil(part.text.length / 4);
-        // ~100 tokens per image as a routing heuristic
+        if (part.type === 'text') return sum + Math.ceil((part.text ?? '').length / 4);
         return sum + 100;
       }, 0);
     }

@@ -1,6 +1,6 @@
 import type {
   ChatMessage,
-  ContentPart,
+  ChatContentBlock,
   ChatCompletionResponse,
   ChatCompletionChunk,
   ChatToolCall,
@@ -9,6 +9,7 @@ import type {
   TokenUsage,
 } from '@freellmapi/shared/types.js';
 import { BaseProvider, type CompletionOptions } from './base.js';
+import { contentToString } from '../lib/content.js';
 
 const API_BASE = 'https://generativelanguage.googleapis.com/v1beta';
 
@@ -72,21 +73,32 @@ function toGeminiFinishReason(finishReason?: string): string {
   return 'stop';
 }
 
-function stripJsonSchemaFields(obj: unknown): unknown {
-  if (Array.isArray(obj)) return obj.map(stripJsonSchemaFields);
-  if (obj && typeof obj === 'object') {
-    const cleaned: Record<string, unknown> = {};
-    for (const [key, value] of Object.entries(obj as Record<string, unknown>)) {
-      if (key === '$schema' || key === 'additionalProperties') continue;
-      if (key === 'type' && Array.isArray(value)) {
-        cleaned.type = value.filter((t: unknown) => t !== 'null')[0] ?? 'string';
-        continue;
-      }
-      cleaned[key] = stripJsonSchemaFields(value);
-    }
-    return cleaned;
+// Google Gemini accepts only a subset of JSON Schema (~OpenAPI 3.0).
+// Strip fields that opencode / other strict-JSON-Schema clients send but
+// Google rejects with 400 "Unknown name '<field>'".
+const GEMINI_UNSUPPORTED_SCHEMA_KEYS = new Set([
+  '$schema', '$id', '$ref', '$defs', '$comment',
+  'definitions',
+  'exclusiveMinimum', 'exclusiveMaximum',
+  'patternProperties', 'unevaluatedProperties', 'unevaluatedItems',
+  'if', 'then', 'else',
+  'contentEncoding', 'contentMediaType', 'contentSchema',
+  'dependentRequired', 'dependentSchemas',
+]);
+
+export function sanitizeForGemini(schema: unknown): unknown {
+  if (Array.isArray(schema)) {
+    return schema.map(sanitizeForGemini);
   }
-  return obj;
+  if (schema && typeof schema === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(schema as Record<string, unknown>)) {
+      if (GEMINI_UNSUPPORTED_SCHEMA_KEYS.has(k)) continue;
+      out[k] = sanitizeForGemini(v);
+    }
+    return out;
+  }
+  return schema;
 }
 
 function toGeminiTools(tools?: ChatToolDefinition[]): Array<{ functionDeclarations: Array<Record<string, unknown>> }> | undefined {
@@ -96,7 +108,7 @@ function toGeminiTools(tools?: ChatToolDefinition[]): Array<{ functionDeclaratio
     functionDeclarations: tools.map(t => ({
       name: t.function.name,
       description: t.function.description,
-      parameters: t.function.parameters ? stripJsonSchemaFields(t.function.parameters) : undefined,
+      parameters: sanitizeForGemini(t.function.parameters),
     })),
   }];
 }
@@ -139,11 +151,15 @@ async function imageUrlToInlineData(url: string): Promise<{ mimeType: string; da
   return { mimeType, data };
 }
 
-// Translate OpenAI messages to Gemini format
+// Translate OpenAI messages to Gemini format. Content may arrive as a string,
+// null, or the OpenAI multimodal array envelope. User messages with image_url
+// parts are converted to Gemini inlineData; everything else is flattened via
+// contentToString so system/user/tool messages all surface as `parts:[{text}]`.
 async function toGeminiContents(messages: ChatMessage[]) {
   const systemMessages = messages
-    .filter(m => m.role === 'system' && typeof m.content === 'string' && m.content.length > 0)
-    .map(m => m.content as string);
+    .filter(m => m.role === 'system')
+    .map(m => contentToString(m.content))
+    .filter(s => s.length > 0);
 
   const toolNameByCallId = new Map<string, string>();
   for (const m of messages) {
@@ -160,8 +176,9 @@ async function toGeminiContents(messages: ChatMessage[]) {
           if (m.role === 'assistant') {
             const parts: GeminiPart[] = [];
 
-            if (typeof m.content === 'string' && m.content.length > 0) {
-              parts.push({ text: m.content });
+            const assistantText = contentToString(m.content);
+            if (assistantText.length > 0) {
+              parts.push({ text: assistantText });
             }
 
             for (const call of m.tool_calls ?? []) {
@@ -187,7 +204,7 @@ async function toGeminiContents(messages: ChatMessage[]) {
             if (!toolCallId) return null;
 
             const toolName = m.name ?? toolNameByCallId.get(toolCallId) ?? 'tool';
-            const response = safeParseObject(typeof m.content === 'string' ? m.content : '');
+            const response = safeParseObject(contentToString(m.content));
 
             return {
               role: 'user',
@@ -217,9 +234,10 @@ async function toGeminiContents(messages: ChatMessage[]) {
 
           // ContentPart[] — text and/or image_url parts
           const parts = await Promise.all(
-            m.content.map(async part => {
-              if (part.type === 'text') return { text: part.text } as GeminiPart;
-              const inlineData = await imageUrlToInlineData(part.image_url.url);
+            (m.content as ChatContentBlock[]).map(async part => {
+              if (part.type === 'text') return { text: part.text ?? '' } as GeminiPart;
+              const imagePart = part as unknown as { type: 'image_url'; image_url: { url: string } };
+              const inlineData = await imageUrlToInlineData(imagePart.image_url.url);
               return { inlineData } as GeminiPart;
             }),
           );
@@ -407,7 +425,15 @@ export class GoogleProvider extends BaseProvider {
           return;
         }
 
-        const chunk = JSON.parse(raw) as GeminiResponse;
+        // Skip malformed SSE frames instead of aborting the whole stream.
+        // Matches the defensive parse in openai-compat / cohere / cloudflare:
+        // a single corrupt chunk shouldn't take down the rest of the response.
+        let chunk: GeminiResponse;
+        try {
+          chunk = JSON.parse(raw) as GeminiResponse;
+        } catch {
+          continue;
+        }
         const candidate = chunk.candidates?.[0];
         const parts = candidate?.content?.parts ?? [];
 
