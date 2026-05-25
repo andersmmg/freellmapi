@@ -5,6 +5,16 @@ import { startHealthChecker } from './services/health.js';
 
 const PORT = process.env.PORT ?? 3001;
 
+// Prevent the process from crashing on unhandled errors.
+// Node 15+ exits by default on unhandled rejections; a single async
+// route handler bug can take down the whole server. Log and continue.
+process.on('unhandledRejection', (reason) => {
+  console.error('[Fatal] Unhandled rejection — server continues:', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('[Fatal] Uncaught exception — server continues:', err);
+});
+
 async function main() {
   initDb();
   const app = createApp();
