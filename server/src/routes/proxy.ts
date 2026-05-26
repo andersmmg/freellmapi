@@ -240,7 +240,8 @@ export function isRetryableError(err: any): boolean {
     // setCooldown + the health checker will avoid this model on subsequent requests.
     || msg.includes('404') || msg.includes('not found') || msg.includes('no endpoints found')
     || msg.includes('no longer available')
-    || msg.includes('thought_signature');
+    || msg.includes('thought_signature')
+    || msg.includes('tool calling');
 }
 
 function isPermanentError(err: any): boolean {
