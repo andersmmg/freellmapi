@@ -79,6 +79,7 @@ function toGeminiFinishReason(finishReason?: string): string {
 const GEMINI_UNSUPPORTED_SCHEMA_KEYS = new Set([
   '$schema', '$id', '$ref', '$defs', '$comment',
   'definitions',
+  'additionalProperties',
   'exclusiveMinimum', 'exclusiveMaximum',
   'patternProperties', 'unevaluatedProperties', 'unevaluatedItems',
   'if', 'then', 'else',
