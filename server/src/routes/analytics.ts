@@ -1,6 +1,9 @@
 import { Router } from 'express';
 import type { Request, Response } from 'express';
-import { getDb } from '../db/index.js';
+import { getDb, getUnifiedApiKey } from '../db/index.js';
+import { getProvider } from '../providers/index.js';
+import { decrypt } from '../lib/crypto.js';
+import type { ChatMessage } from '@freellmapi/shared/types.js';
 
 export const analyticsRouter = Router();
 
@@ -298,4 +301,59 @@ analyticsRouter.get('/errors', (req: Request, res: Response) => {
     latencyMs: r.latency_ms,
     createdAt: r.created_at,
   })));
+});
+
+// Test a specific model with a tiny request.
+// Used by the Model Test page to check which models are actually working.
+analyticsRouter.post('/test-model', async (req: Request, res: Response) => {
+  const { modelDbId } = req.body;
+  if (!modelDbId || typeof modelDbId !== 'number') {
+    res.status(400).json({ error: 'modelDbId is required' });
+    return;
+  }
+
+  const db = getDb();
+
+  const model = db.prepare('SELECT * FROM models WHERE id = ? AND enabled = 1').get(modelDbId) as any;
+  if (!model) {
+    res.status(404).json({ error: 'Model not found or disabled' });
+    return;
+  }
+
+  const provider = getProvider(model.platform as any);
+  if (!provider) {
+    res.status(400).json({ error: `No provider for platform: ${model.platform}` });
+    return;
+  }
+
+  const keys = db.prepare(
+    'SELECT * FROM api_keys WHERE platform = ? AND enabled = 1 AND status != ?'
+  ).all(model.platform, 'invalid') as any[];
+
+  if (keys.length === 0) {
+    res.status(400).json({ error: `No active keys for platform: ${model.platform}` });
+    return;
+  }
+
+  const key = keys[0];
+  let apiKey: string;
+  try {
+    apiKey = decrypt(key.encrypted_key, key.iv, key.auth_tag);
+  } catch {
+    res.status(500).json({ error: 'Failed to decrypt API key' });
+    return;
+  }
+
+  const messages: ChatMessage[] = [{ role: 'user', content: 'hi' }];
+  const start = Date.now();
+
+  try {
+    const result = await provider.chatCompletion(apiKey, messages, model.model_id, { max_tokens: 1 });
+    const latency = Date.now() - start;
+    res.json({ success: true, latency, modelId: model.model_id, platform: model.platform });
+  } catch (err: any) {
+    const latency = Date.now() - start;
+    const message = (err.message ?? String(err)).slice(0, 500);
+    res.json({ success: false, latency, error: message, modelId: model.model_id, platform: model.platform });
+  }
 });
