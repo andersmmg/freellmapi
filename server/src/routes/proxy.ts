@@ -263,6 +263,25 @@ function isPermanentError(err: any): boolean {
   return msg.includes('no longer available') || msg.includes('has transitioned');
 }
 
+// Errors that are model-level (same model fails identically with every key)
+// vs. key-level (rate limits that a different key might not hit).
+// Model-level errors should skip all keys for the same model, not just the current key.
+function isModelLevelError(err: any): boolean {
+  const msg = (err.message ?? '').toLowerCase();
+  return msg.includes('tool calling')
+    || msg.includes('thought_signature')
+    || msg.includes('no endpoints found')
+    || msg.includes('no longer available')
+    || msg.includes('not found')
+    || msg.includes('404')
+    || msg.includes('413')
+    || msg.includes('payload too large')
+    || msg.includes('request body too large')
+    || msg.includes('request entity too large')
+    || msg.includes('content too large')
+    || msg.includes('request too large');
+}
+
 // Parse provider 413 errors for actual rate limits and update both the in-memory
 // dynamic limits and the DB so the router stops sending oversize requests.
 // Example: "Groq API error 413: Request too large ... on tokens per minute (TPM): Limit 8000, Requested 18677"
@@ -297,6 +316,18 @@ function updateLimitsFromError(err: any, platform: string, modelId: string, keyI
   const rpmPattern = /on\s+requests\s+per\s+(minute|day)\s+\((\w+)\):\s*Limit\s+(\d+)/i;
   const rpmMatch = msg.match(rpmPattern);
   if (rpmMatch) applyLimit(rpmMatch[2].toLowerCase(), parseInt(rpmMatch[3], 10));
+
+  // Charge the actual requested tokens to the rolling window so canUseTokens
+  // can accurately refuse subsequent requests even when our estimate is low.
+  // Matches: "Requested 18677", "Requested 20000", etc.
+  const requestedMatch = msg.match(/requested\s+(\d+)/i);
+  if (requestedMatch) {
+    const actualTokens = parseInt(requestedMatch[1], 10);
+    if (actualTokens > 0) {
+      recordTokens(platform, modelId, keyId, actualTokens);
+      console.log(`[Proxy] Charged ${actualTokens} actual tokens to rolling window for ${platform}/${modelId}`);
+    }
+  }
 }
 
 proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
@@ -535,6 +566,10 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         // Put this model+key on cooldown and try the next one
         const skipId = `${route.platform}:${route.modelId}:${route.keyId}`;
         skipKeys.add(skipId);
+        // For model-level errors (not rate limits), skip all keys for this model
+        if (isModelLevelError(err)) {
+          skipKeys.add(`${route.platform}:${route.modelId}`);
+        }
         if (isPermanentError(err)) {
           const db = getDb();
           db.prepare('UPDATE models SET enabled = 0 WHERE id = ?').run(route.modelDbId);

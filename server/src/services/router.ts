@@ -207,6 +207,8 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
 
       const skipId = `${model.platform}:${model.model_id}:${key.id}`;
       if (skipKeys?.has(skipId)) continue;
+      // Model-level skip — all keys for this model failed with a non-rate-limit error
+      if (skipKeys?.has(`${model.platform}:${model.model_id}`)) continue;
 
       // Check cooldown (from previous 429s)
       if (isOnCooldown(model.platform, model.model_id, key.id)) continue;
