@@ -4,7 +4,7 @@ import type { Request, Response } from 'express';
 import { z } from 'zod';
 import type { AutoMode, ChatMessage } from '@freellmapi/shared/types.js';
 import { routeRequest, recordRateLimitHit, recordSuccess, type RouteResult } from '../services/router.js';
-import { recordRequest, recordTokens, setCooldown } from '../services/ratelimit.js';
+import { recordRequest, recordTokens, setCooldown, setDynamicLimit } from '../services/ratelimit.js';
 import { getDb, getUnifiedApiKey } from '../db/index.js';
 import { getProvider } from '../providers/index.js';
 import { decrypt } from '../lib/crypto.js';
@@ -223,6 +223,19 @@ const chatCompletionSchema = z.object({
   parallel_tool_calls: z.boolean().optional(),
 });
 
+// Clean provider error messages for storage and display — strip verbose marketing
+// text, org IDs, URLs, and other noise that isn't useful for debugging.
+function cleanErrorMessage(msg: string): string {
+  let cleaned = msg.replace(/\s*Need more tokens\?.*$/i, '');
+  cleaned = cleaned.replace(/\s*Upgrade to.*$/i, '');
+  cleaned = cleaned.replace(/\s*Sign up.*$/i, '');
+  cleaned = cleaned.replace(/\s*Visit https?:\/\/\S+\s*$/i, '');
+  cleaned = cleaned.replace(/ in organization `[^`]+`/g, '');
+  cleaned = cleaned.replace(/ for organization [a-z0-9_]+/g, '');
+  cleaned = cleaned.replace(/ service tier `[^`]+`/g, '');
+  return cleaned.trim();
+}
+
 export function isRetryableError(err: any): boolean {
   const msg = (err.message ?? '').toLowerCase();
   return msg.includes('429') || msg.includes('rate limit') || msg.includes('too many requests')
@@ -235,6 +248,7 @@ export function isRetryableError(err: any): boolean {
     // provider in the fallback chain may have a larger limit. Same reasoning as 503.
     || msg.includes('413') || msg.includes('payload too large') || msg.includes('request body too large')
     || msg.includes('request entity too large') || msg.includes('content too large')
+    || msg.includes('request too large')
     // 404: model deprecated/removed upstream (e.g. OpenRouter's "no endpoints found"
     // for a model that's been pulled). Rotate to the next model in the chain —
     // setCooldown + the health checker will avoid this model on subsequent requests.
@@ -247,6 +261,42 @@ export function isRetryableError(err: any): boolean {
 function isPermanentError(err: any): boolean {
   const msg = (err.message ?? '').toLowerCase();
   return msg.includes('no longer available') || msg.includes('has transitioned');
+}
+
+// Parse provider 413 errors for actual rate limits and update both the in-memory
+// dynamic limits and the DB so the router stops sending oversize requests.
+// Example: "Groq API error 413: Request too large ... on tokens per minute (TPM): Limit 8000, Requested 18677"
+function updateLimitsFromError(err: any, platform: string, modelId: string, keyId: number, modelDbId?: number) {
+  const msg = err.message ?? '';
+  const db = getDb();
+
+  function applyLimit(type: string, limit: number) {
+    if (limit <= 0) return;
+    const key = `${platform}:${modelId}:${keyId}:${type}`;
+    setDynamicLimit(key, limit);
+    console.log(`[Proxy] Learned dynamic ${type} limit for ${platform}/${modelId}: ${limit}`);
+
+    // Persist to the model row so the limit survives a restart.
+    // Only lower the stored limit, never raise it — the provider is the source of truth.
+    if (modelDbId) {
+      const col = type === 'tpm' ? 'tpm_limit' : type === 'tpd' ? 'tpd_limit' : type === 'rpm' ? 'rpm_limit' : type === 'rpd' ? 'rpd_limit' : null;
+      if (col) {
+        const current = db.prepare(`SELECT ${col} FROM models WHERE id = ?`).get(modelDbId) as Record<string, number | null>;
+        if (current && (current[col] === null || limit < current[col]!)) {
+          db.prepare(`UPDATE models SET ${col} = ? WHERE id = ?`).run(limit, modelDbId);
+          console.log(`[Proxy] Persisted ${type} limit ${limit} for model ${modelDbId}`);
+        }
+      }
+    }
+  }
+
+  const limitPattern = /on\s+tokens\s+per\s+(minute|day)\s+\((\w+)\):\s*Limit\s+(\d+)/i;
+  const match = msg.match(limitPattern);
+  if (match) applyLimit(match[2].toLowerCase(), parseInt(match[3], 10));
+
+  const rpmPattern = /on\s+requests\s+per\s+(minute|day)\s+\((\w+)\):\s*Limit\s+(\d+)/i;
+  const rpmMatch = msg.match(rpmPattern);
+  if (rpmMatch) applyLimit(rpmMatch[2].toLowerCase(), parseInt(rpmMatch[3], 10));
 }
 
 proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
@@ -411,7 +461,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         try {
           const gen = route.provider.streamChatCompletion(
             route.apiKey, messages, route.modelId,
-            { temperature, max_tokens, top_p, tools, tool_choice, parallel_tool_calls },
+            { temperature, max_tokens, top_p, tools, tool_choice, parallel_tool_calls, keyId: route.keyId },
           );
 
           for await (const chunk of gen) {
@@ -442,15 +492,11 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           return;
         } catch (streamErr: any) {
           if (streamStarted) {
-            // Mid-stream error — finish the SSE response cleanly instead of leaving
-            // the client hanging or letting Express's default handler take over.
-            // Full upstream message goes to the log; the client sees a generic
-            // message so we don't leak provider internals into a partial stream.
             console.error(`[Proxy] Mid-stream error from ${route.displayName}:`, streamErr.message);
             const payload = { error: { message: `Provider error (${route.displayName}): stream interrupted`, type: 'stream_error' } };
             try { res.write(`data: ${JSON.stringify(payload)}\n\n`); } catch { /* socket gone */ }
             try { res.write('data: [DONE]\n\n'); res.end(); } catch { /* socket gone */ }
-            logRequest(route.platform, route.modelId, 'error', estimatedInputTokens, totalOutputTokens, Date.now() - start, streamErr.message);
+            logRequest(route.platform, route.modelId, 'error', estimatedInputTokens, totalOutputTokens, Date.now() - start, cleanErrorMessage(streamErr.message ?? ''));
             return;
           }
           // Pre-stream error — bubble to outer retry/502 handler.
@@ -459,7 +505,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
       } else {
         const result = await route.provider.chatCompletion(
           route.apiKey, messages, route.modelId,
-          { temperature, max_tokens, top_p, tools, tool_choice, parallel_tool_calls },
+          { temperature, max_tokens, top_p, tools, tool_choice, parallel_tool_calls, keyId: route.keyId },
         );
 
         const totalTokens = result.usage?.total_tokens ?? 0;
@@ -481,7 +527,9 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
       }
     } catch (err: any) {
       const latency = Date.now() - start;
-      logRequest(route.platform, route.modelId, 'error', estimatedInputTokens, 0, latency, err.message);
+      updateLimitsFromError(err, route.platform, route.modelId, route.keyId, route.modelDbId);
+      const cleanErr = cleanErrorMessage(err.message ?? '');
+      logRequest(route.platform, route.modelId, 'error', estimatedInputTokens, 0, latency, cleanErr);
 
       if (isRetryableError(err)) {
         // Put this model+key on cooldown and try the next one
@@ -490,20 +538,20 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         if (isPermanentError(err)) {
           const db = getDb();
           db.prepare('UPDATE models SET enabled = 0 WHERE id = ?').run(route.modelDbId);
-          console.log(`[Proxy] Disabling ${route.displayName} — ${err.message.slice(0, 120)}`);
+          console.log(`[Proxy] Disabling ${route.displayName} — ${cleanErr.slice(0, 120)}`);
         } else {
           setCooldown(route.platform, route.modelId, route.keyId, 120_000);
         }
         recordRateLimitHit(route.modelDbId);
         lastError = err;
-        console.log(`[Proxy] ${err.message.slice(0, 80)} from ${route.displayName}, falling back (attempt ${attempt + 1}/${MAX_RETRIES})`);
+        console.log(`[Proxy] ${cleanErr.slice(0, 80)} from ${route.displayName}, falling back (attempt ${attempt + 1}/${MAX_RETRIES})`);
         continue;
       }
 
       // Non-retryable error (auth, 4xx, etc.): don't retry
       res.status(502).json({
         error: {
-          message: `Provider error (${route.displayName}): ${err.message}`,
+          message: `Provider error (${route.displayName}): ${cleanErr}`,
           type: 'provider_error',
         },
       });
@@ -514,7 +562,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   // Exhausted all retries
   res.status(429).json({
     error: {
-      message: `All models rate-limited after ${MAX_RETRIES} attempts. Last: ${lastError?.message}`,
+      message: `All models rate-limited after ${MAX_RETRIES} attempts. Last: ${cleanErrorMessage(lastError?.message ?? '')}`,
       type: 'rate_limit_error',
     },
   });
@@ -633,17 +681,17 @@ proxyRouter.post('/audio/transcriptions', async (req: Request, res: Response) =>
       return;
     } catch (err: any) {
       lastErr = err;
-      console.log(`[Proxy] Transcription error from ${c.displayName}: ${err.message.slice(0, 100)}`);
-      // Log failure
+      const cleanTranscribeErr = cleanErrorMessage(err.message?.slice(0, 200) ?? '');
+      console.log(`[Proxy] Transcription error from ${c.displayName}: ${cleanTranscribeErr.slice(0, 100)}`);
       try {
         db.prepare('INSERT INTO requests (platform, model_id, status, input_tokens, output_tokens, latency_ms, error) VALUES (?, ?, ?, ?, ?, ?, ?)')
-          .run(c.platform, c.modelId, 'error', 0, 0, Date.now() - start, err.message?.slice(0, 200));
+          .run(c.platform, c.modelId, 'error', 0, 0, Date.now() - start, cleanTranscribeErr);
       } catch { /* log best-effort */ }
     }
   }
 
   res.status(502).json({
-    error: { message: `All transcription providers failed. Last error: ${lastErr?.message ?? 'Unknown'}`, type: 'provider_error' },
+    error: { message: `All transcription providers failed. Last error: ${cleanErrorMessage(lastErr?.message ?? 'Unknown')}`, type: 'provider_error' },
   });
 });
 

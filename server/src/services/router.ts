@@ -14,6 +14,7 @@ interface ModelRow {
   rpd_limit: number | null;
   tpm_limit: number | null;
   tpd_limit: number | null;
+  context_window: number | null;
   multimodal: number;
 }
 
@@ -171,6 +172,11 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
 
     // Skip text-only models when the request contains images
     if (requireMultimodal && !model.multimodal) continue;
+
+    // Skip models whose context window is too small for this request.
+    // Prevents 413 errors from models like Groq's gpt-oss-20b (8K limit)
+    // when the request needs 15K+ tokens. Leave a 10% headroom buffer.
+    if (model.context_window && estimatedTokens > model.context_window * 0.9) continue;
 
     // Check if we have a provider for this platform
     const provider = getProvider(model.platform as any);

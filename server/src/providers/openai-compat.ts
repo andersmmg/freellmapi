@@ -7,12 +7,40 @@ import type {
   TranscriptionResult,
 } from '@freellmapi/shared/types.js';
 import { BaseProvider, type CompletionOptions } from './base.js';
+import { setDynamicLimit } from '../services/ratelimit.js';
 
 /**
  * Generic provider for platforms that use an OpenAI-compatible API.
  * Covers: Groq, Cerebras, SambaNova, NVIDIA NIM, Mistral, OpenRouter,
  * GitHub Models, Fireworks AI.
  */
+function parseRateLimitHeaders(headers: Headers, platform: string, modelId: string, keyId?: number) {
+  if (!keyId) return;
+
+  // Most OpenAI-compatible providers return these (Groq, OpenRouter, etc.)
+  const tpmLimit = headers.get('x-ratelimit-limit-tokens');
+  const rpmLimit = headers.get('x-ratelimit-limit-requests');
+  const remainingTokens = headers.get('x-ratelimit-remaining-tokens');
+  const remainingRequests = headers.get('x-ratelimit-remaining-requests');
+
+  if (tpmLimit) {
+    const limit = parseInt(tpmLimit, 10);
+    if (limit > 0) setDynamicLimit(`${platform}:${modelId}:${keyId}:tpm`, limit);
+  }
+  if (rpmLimit) {
+    const limit = parseInt(rpmLimit, 10);
+    if (limit > 0) setDynamicLimit(`${platform}:${modelId}:${keyId}:rpm`, limit);
+  }
+  // If remaining is 0, we're at the limit — set a short cooldown to give
+  // the router a chance to pick a different model rather than retry this one.
+  if (remainingTokens === '0') {
+    setDynamicLimit(`${platform}:${modelId}:${keyId}:tpm`, 1);
+  }
+  if (remainingRequests === '0') {
+    setDynamicLimit(`${platform}:${modelId}:${keyId}:rpm`, 0);
+  }
+}
+
 export class OpenAICompatProvider extends BaseProvider {
   readonly platform: Platform;
   readonly name: string;
@@ -70,6 +98,9 @@ export class OpenAICompatProvider extends BaseProvider {
       throw new Error(`${this.name} API error ${res.status}: ${(err as any).error?.message ?? res.statusText}`);
     }
 
+    // Learn rate limits from response headers (Groq, OpenRouter, etc.)
+    parseRateLimitHeaders(res.headers, this.platform, modelId, options?.keyId);
+
     const data = await res.json() as ChatCompletionResponse;
     normalizeChoices(data);
     data._routed_via = { platform: this.platform, model: modelId };
@@ -106,6 +137,9 @@ export class OpenAICompatProvider extends BaseProvider {
       const err = await res.json().catch(() => ({}));
       throw new Error(`${this.name} API error ${res.status}: ${(err as any).error?.message ?? res.statusText}`);
     }
+
+    // Learn rate limits from response headers (Groq, OpenRouter, etc.)
+    parseRateLimitHeaders(res.headers, this.platform, modelId, options?.keyId);
 
     const reader = res.body?.getReader();
     if (!reader) throw new Error('No response body');

@@ -34,18 +34,20 @@ export function canMakeRequest(
 ): boolean {
   const now = Date.now();
 
-  if (limits.rpm !== null) {
-    const key = `${platform}:${modelId}:${keyId}:rpm`;
-    const w = getWindow(key);
+  const rpmKey = `${platform}:${modelId}:${keyId}:rpm`;
+  const effectiveRpm = getEffectiveLimit(rpmKey, limits.rpm);
+  if (effectiveRpm !== null) {
+    const w = getWindow(rpmKey);
     w.timestamps = pruneTimestamps(w.timestamps, MINUTE, now);
-    if (w.timestamps.length >= limits.rpm) return false;
+    if (w.timestamps.length >= effectiveRpm) return false;
   }
 
-  if (limits.rpd !== null) {
-    const key = `${platform}:${modelId}:${keyId}:rpd`;
-    const w = getWindow(key);
+  const rpdKey = `${platform}:${modelId}:${keyId}:rpd`;
+  const effectiveRpd = getEffectiveLimit(rpdKey, limits.rpd);
+  if (effectiveRpd !== null) {
+    const w = getWindow(rpdKey);
     w.timestamps = pruneTimestamps(w.timestamps, DAY, now);
-    if (w.timestamps.length >= limits.rpd) return false;
+    if (w.timestamps.length >= effectiveRpd) return false;
   }
 
   return true;
@@ -60,20 +62,22 @@ export function canUseTokens(
 ): boolean {
   const now = Date.now();
 
-  if (limits.tpm !== null) {
-    const key = `${platform}:${modelId}:${keyId}:tpm`;
-    const w = getWindow(key);
+  const tpmKey = `${platform}:${modelId}:${keyId}:tpm`;
+  const effectiveTpm = getEffectiveLimit(tpmKey, limits.tpm);
+  if (effectiveTpm !== null) {
+    const w = getWindow(tpmKey);
     w.tokenTimestamps = w.tokenTimestamps.filter(t => t.ts > now - MINUTE);
     const used = w.tokenTimestamps.reduce((sum, t) => sum + t.tokens, 0);
-    if (used + estimatedTokens > limits.tpm) return false;
+    if (used + estimatedTokens > effectiveTpm) return false;
   }
 
-  if (limits.tpd !== null) {
-    const key = `${platform}:${modelId}:${keyId}:tpd`;
-    const w = getWindow(key);
+  const tpdKey = `${platform}:${modelId}:${keyId}:tpd`;
+  const effectiveTpd = getEffectiveLimit(tpdKey, limits.tpd);
+  if (effectiveTpd !== null) {
+    const w = getWindow(tpdKey);
     w.tokenTimestamps = w.tokenTimestamps.filter(t => t.ts > now - DAY);
     const used = w.tokenTimestamps.reduce((sum, t) => sum + t.tokens, 0);
-    if (used + estimatedTokens > limits.tpd) return false;
+    if (used + estimatedTokens > effectiveTpd) return false;
   }
 
   return true;
@@ -102,6 +106,29 @@ export function recordTokens(
 
   const tpdKey = `${platform}:${modelId}:${keyId}:tpd`;
   getWindow(tpdKey).tokenTimestamps.push({ ts: now, tokens });
+}
+
+// Dynamic limits: when a provider returns 413 with actual limit info (e.g.
+// "Limit 8000, Requested 18677"), we learn the real limit and enforce it
+// so the router never retries oversize requests against that model+key.
+// Map key: "platform:modelId:keyId:type" (type = tpm|tpd|rpm|rpd)
+const dynamicLimits = new Map<string, number>();
+
+export function getEffectiveLimit(
+  key: string,
+  dbLimit: number | null,
+): number | null {
+  const dynamic = dynamicLimits.get(key);
+  if (dynamic !== undefined) return dynamic;
+  return dbLimit;
+}
+
+export function setDynamicLimit(key: string, limit: number) {
+  // Only lower limits, never raise — the provider's reported limit is a ceiling.
+  const existing = dynamicLimits.get(key);
+  if (existing === undefined || limit < existing) {
+    dynamicLimits.set(key, limit);
+  }
 }
 
 // Cooldown: when a provider returns 429, block that model+key for a period

@@ -219,7 +219,10 @@ analyticsRouter.get('/requests', (req: Request, res: Response) => {
   const status = (req.query.status as string) ?? '';
   const platform = (req.query.platform as string) ?? '';
   const page = Math.max(1, parseInt((req.query.page as string) ?? '1', 10) || 1);
-  const perPage = Math.min(200, Math.max(1, parseInt((req.query.perPage as string) ?? '50', 10) || 50));
+  const isExport = req.query.export === '1';
+  const perPage = isExport
+    ? Math.min(10000, Math.max(1, parseInt((req.query.perPage as string) ?? '10000', 10) || 10000))
+    : Math.min(200, Math.max(1, parseInt((req.query.perPage as string) ?? '50', 10) || 50));
   const db = getDb();
 
   const conditions: string[] = [];

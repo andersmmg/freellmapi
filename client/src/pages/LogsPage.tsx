@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useCallback } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { apiFetch } from '@/lib/api'
 import { Button } from '@/components/ui/button'
@@ -9,6 +9,18 @@ function formatTime(iso: string) {
   const d = new Date(iso)
   return d.toLocaleDateString([], { month: 'short', day: 'numeric' }) +
     ' ' + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+}
+
+function escapeCsv(val: string): string {
+  if (val.includes(',') || val.includes('"') || val.includes('\n')) {
+    return `"${val.replace(/"/g, '""')}"`
+  }
+  return val
+}
+
+function formatTimeIso(iso: string): string {
+  const d = new Date(iso)
+  return d.toISOString()
 }
 
 function StatusBadge({ status }: { status: string }) {
@@ -46,6 +58,37 @@ export default function LogsPage() {
     updater()
     setPage(1)
   }
+
+  const [exporting, setExporting] = useState(false)
+  const exportCsv = useCallback(async () => {
+    setExporting(true)
+    try {
+      const res = await apiFetch<any>(
+        `/api/analytics/requests?range=${range}&status=${statusFilter}&platform=${platformFilter}&page=1&perPage=10000&export=1`
+      )
+      const rows = res.requests ?? []
+      const header = 'Time,Platform,Model,Status,Latency (ms),In Tokens,Out Tokens,Error'
+      const csv = rows.map((r: any) => [
+        formatTimeIso(r.createdAt),
+        r.platform,
+        r.modelId,
+        r.status,
+        r.latencyMs,
+        r.inputTokens ?? 0,
+        r.outputTokens ?? 0,
+        escapeCsv(r.error ?? ''),
+      ].join(',')).join('\n')
+      const blob = new Blob([header + '\n' + csv], { type: 'text/csv' })
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `freellmapi-logs-${range}-${statusFilter || 'all'}.csv`
+      a.click()
+      URL.revokeObjectURL(url)
+    } finally {
+      setExporting(false)
+    }
+  }, [range, statusFilter, platformFilter])
 
   return (
     <div>
@@ -95,6 +138,9 @@ export default function LogsPage() {
           <p className="text-xs text-muted-foreground ml-auto">
             {data ? `${data.total} request${data.total !== 1 ? 's' : ''}` : ''}
           </p>
+          <Button variant="outline" size="xs" onClick={exportCsv} disabled={exporting}>
+            {exporting ? 'Exporting...' : 'Export CSV'}
+          </Button>
         </div>
 
         <div className="rounded-lg border bg-card">
