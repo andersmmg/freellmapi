@@ -184,7 +184,7 @@ async function toGeminiContents(messages: ChatMessage[]) {
 
             for (const call of m.tool_calls ?? []) {
               parts.push({
-                thoughtSignature: call.thought_signature,
+                thoughtSignature: call.thought_signature ?? '',
                 functionCall: {
                   id: call.id,
                   name: call.function.name,
