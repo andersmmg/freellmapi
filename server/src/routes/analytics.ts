@@ -213,6 +213,66 @@ analyticsRouter.get('/error-distribution', (req: Request, res: Response) => {
   });
 });
 
+// Paginated request log with filtering
+analyticsRouter.get('/requests', (req: Request, res: Response) => {
+  const range = (req.query.range as string) ?? '7d';
+  const status = (req.query.status as string) ?? '';
+  const platform = (req.query.platform as string) ?? '';
+  const page = Math.max(1, parseInt((req.query.page as string) ?? '1', 10) || 1);
+  const perPage = Math.min(200, Math.max(1, parseInt((req.query.perPage as string) ?? '50', 10) || 50));
+  const db = getDb();
+
+  const conditions: string[] = [];
+  const params: any[] = [];
+
+  if (range !== 'all') {
+    conditions.push('created_at >= ?');
+    params.push(getSinceTimestamp(range));
+  }
+  if (status === 'success' || status === 'error') {
+    conditions.push('status = ?');
+    params.push(status);
+  }
+  if (platform) {
+    conditions.push('platform = ?');
+    params.push(platform);
+  }
+
+  const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+
+  const countRow = db.prepare(`SELECT COUNT(*) as cnt FROM requests ${where}`).get(...params) as { cnt: number };
+  const total = countRow.cnt;
+
+  const offset = (page - 1) * perPage;
+  const rows = db.prepare(`
+    SELECT id, platform, model_id, status, input_tokens, output_tokens, latency_ms, error, created_at
+    FROM requests ${where}
+    ORDER BY created_at DESC
+    LIMIT ? OFFSET ?
+  `).all(...params, perPage, offset) as any[];
+
+  const platforms = db.prepare(`SELECT DISTINCT platform FROM requests ORDER BY platform`).all() as { platform: string }[];
+
+  res.json({
+    requests: rows.map(r => ({
+      id: r.id,
+      platform: r.platform,
+      modelId: r.model_id,
+      status: r.status,
+      inputTokens: r.input_tokens,
+      outputTokens: r.output_tokens,
+      latencyMs: r.latency_ms,
+      error: r.error,
+      createdAt: r.created_at,
+    })),
+    total,
+    page,
+    perPage,
+    totalPages: Math.ceil(total / perPage),
+    platforms: platforms.map(p => p.platform),
+  });
+});
+
 // Recent errors
 analyticsRouter.get('/errors', (req: Request, res: Response) => {
   const range = (req.query.range as string) ?? '7d';
