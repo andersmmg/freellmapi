@@ -520,6 +520,12 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           recordTokens(route.platform, route.modelId, route.keyId, estimatedInputTokens + totalOutputTokens);
           recordSuccess(route.modelDbId);
           setStickyModel(messages, route.modelDbId, autoMode);
+
+          logRequest(
+            route.platform, route.modelId, 'success',
+            estimatedInputTokens, totalOutputTokens,
+            Date.now() - start, null,
+          );
           return;
         } catch (streamErr: any) {
           if (streamStarted) {
