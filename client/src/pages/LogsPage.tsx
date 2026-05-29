@@ -4,12 +4,7 @@ import { apiFetch } from '@/lib/api'
 import { Button } from '@/components/ui/button'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { PageHeader } from '@/components/page-header'
-
-function formatTime(iso: string) {
-  const d = new Date(iso)
-  return d.toLocaleDateString([], { month: 'short', day: 'numeric' }) +
-    ' ' + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
-}
+import { formatDateTime } from '@/lib/dates'
 
 function escapeCsv(val: string): string {
   if (val.includes(',') || val.includes('"') || val.includes('\n')) {
@@ -180,7 +175,7 @@ export default function LogsPage() {
                       onClick={() => r.error && setExpandedId(expandedId === r.id ? null : r.id)}
                     >
                       <TableCell className="pl-4 text-xs tabular-nums text-muted-foreground whitespace-nowrap">
-                        {formatTime(r.createdAt)}
+                        {formatDateTime(r.createdAt)}
                       </TableCell>
                       <TableCell className="text-xs">{r.platform}</TableCell>
                       <TableCell className="text-xs max-w-[200px] truncate">{r.modelId}</TableCell>
