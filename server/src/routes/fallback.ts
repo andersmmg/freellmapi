@@ -131,7 +131,7 @@ fallbackRouter.get('/token-usage', (_req: Request, res: Response) => {
            fc.priority
     FROM models m
     JOIN fallback_config fc ON fc.model_db_id = m.id
-    WHERE m.enabled = 1
+    WHERE m.enabled = 1 AND fc.enabled = 1
     ORDER BY fc.priority ASC
   `).all() as { platform: string; model_id: string; display_name: string; monthly_token_budget: string; priority: number }[];
 
