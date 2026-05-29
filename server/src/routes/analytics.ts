@@ -5,6 +5,10 @@ import { getProvider } from '../providers/index.js';
 import { decrypt } from '../lib/crypto.js';
 import type { ChatMessage } from '@freellmapi/shared/types.js';
 
+function zTs(s: string): string {
+  return s.includes('Z') || /[-+]\d{2}:\d{2}$/.test(s) ? s : s + 'Z';
+}
+
 export const analyticsRouter = Router();
 
 // Map range to a JS-computed ISO timestamp passed as a bind parameter,
@@ -269,7 +273,7 @@ analyticsRouter.get('/requests', (req: Request, res: Response) => {
       outputTokens: r.output_tokens,
       latencyMs: r.latency_ms,
       error: r.error,
-      createdAt: r.created_at,
+      createdAt: zTs(r.created_at),
     })),
     total,
     page,
@@ -299,7 +303,7 @@ analyticsRouter.get('/errors', (req: Request, res: Response) => {
     modelId: r.model_id,
     error: r.error,
     latencyMs: r.latency_ms,
-    createdAt: r.created_at,
+    createdAt: zTs(r.created_at),
   })));
 });
 
