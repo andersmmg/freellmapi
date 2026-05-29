@@ -255,7 +255,8 @@ export function isRetryableError(err: any): boolean {
     || msg.includes('404') || msg.includes('not found') || msg.includes('no endpoints found')
     || msg.includes('no longer available')
     || msg.includes('thought_signature')
-    || msg.includes('tool calling');
+    || msg.includes('tool calling')
+    || msg.includes('maximum number of items');
 }
 
 function isPermanentError(err: any): boolean {
@@ -279,7 +280,8 @@ function isModelLevelError(err: any): boolean {
     || msg.includes('request body too large')
     || msg.includes('request entity too large')
     || msg.includes('content too large')
-    || msg.includes('request too large');
+    || msg.includes('request too large')
+    || msg.includes('maximum number of items');
 }
 
 // Parse provider 413 errors for actual rate limits and update both the in-memory
