@@ -43,11 +43,12 @@ export default function LogsPage() {
   const [expandedId, setExpandedId] = useState<number | null>(null)
 
   const queryKey = ['analytics', 'requests', range, statusFilter, platformFilter, page]
-  const { data, isLoading } = useQuery({
+  const { data, isLoading, isRefetching, refetch } = useQuery({
     queryKey,
     queryFn: () => apiFetch<any>(
       `/api/analytics/requests?range=${range}&status=${statusFilter}&platform=${platformFilter}&page=${page}&perPage=50`
     ),
+    refetchInterval: 10_000,
   })
 
   const requests = data?.requests ?? []
@@ -138,6 +139,14 @@ export default function LogsPage() {
           <p className="text-xs text-muted-foreground ml-auto">
             {data ? `${data.total} request${data.total !== 1 ? 's' : ''}` : ''}
           </p>
+          <Button variant="ghost" size="xs" onClick={() => refetch()} disabled={isRefetching}>
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" className={`mr-1 ${isRefetching ? 'animate-spin' : ''}`}>
+              <polyline points="23 4 23 10 17 10"/>
+              <polyline points="1 20 1 14 7 14"/>
+              <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+            </svg>
+            {isRefetching ? '...' : 'Refresh'}
+          </Button>
           <Button variant="outline" size="xs" onClick={exportCsv} disabled={exporting}>
             {exporting ? 'Exporting...' : 'Export CSV'}
           </Button>
